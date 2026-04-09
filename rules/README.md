@@ -14,6 +14,7 @@ rules/
 │   ├── hooks.md
 │   ├── agents.md
 │   └── security.md
+├── cangjie/         # Cangjie (仓颉) specific
 ├── typescript/      # TypeScript/JavaScript specific
 ├── python/          # Python specific
 ├── golang/          # Go specific
@@ -37,6 +38,10 @@ rules/
 ./install.sh web
 ./install.sh swift
 ./install.sh php
+./install.sh cangjie     # 仓颉语言（含 HarmonyOS 扩展）
+./install.sh cj          # cangjie 别名
+./install.sh harmonyos   # cangjie 别名（HarmonyOS 开发）
+./install.sh ohos        # cangjie 别名（OpenHarmony 开发）
 
 # Install multiple languages at once
 ./install.sh typescript python
@@ -61,6 +66,7 @@ cp -r rules/golang ~/.claude/rules/golang
 cp -r rules/web ~/.claude/rules/web
 cp -r rules/swift ~/.claude/rules/swift
 cp -r rules/php ~/.claude/rules/php
+cp -r rules/cangjie ~/.claude/rules/cangjie
 
 # Attention ! ! ! Configure according to your actual project requirements; the configuration here is for reference only.
 ```

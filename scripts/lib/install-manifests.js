@@ -38,13 +38,17 @@ const LEGACY_COMPAT_BASE_MODULE_IDS_BY_TARGET = Object.freeze({
 });
 const LEGACY_LANGUAGE_ALIAS_TO_CANONICAL = Object.freeze({
   c: 'c',
+  cangjie: 'cangjie',
+  cj: 'cangjie',
   cpp: 'cpp',
   csharp: 'csharp',
   go: 'go',
   golang: 'go',
+  harmonyos: 'cangjie',
   java: 'java',
   javascript: 'typescript',
   kotlin: 'java',
+  ohos: 'cangjie',
   perl: 'perl',
   php: 'php',
   python: 'python',
@@ -54,6 +58,7 @@ const LEGACY_LANGUAGE_ALIAS_TO_CANONICAL = Object.freeze({
 });
 const LEGACY_LANGUAGE_EXTRA_MODULE_IDS = Object.freeze({
   c: ['framework-language'],
+  cangjie: [],
   cpp: ['framework-language'],
   csharp: ['framework-language'],
   go: ['framework-language'],
