@@ -114,6 +114,8 @@
         "skills/android-clean-architecture",
         "skills/api-design",
         "skills/backend-patterns",
+        "skills/cangjie-patterns",
+        "skills/cangjie-testing",
         "skills/coding-standards",
         "skills/compose-multiplatform-patterns",
         "skills/csharp-testing",

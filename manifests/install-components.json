@@ -235,6 +235,14 @@
       ]
     },
     {
+      "id": "lang:cangjie",
+      "family": "language",
+      "description": "Cangjie (仓颉) coding standards, HarmonyOS/OpenHarmony patterns, and testing guidance. Resolves through framework-language module.",
+      "modules": [
+        "framework-language"
+      ]
+    },
+    {
       "id": "framework:laravel",
       "family": "framework",
       "description": "Laravel patterns, TDD, verification, and security guidance. Resolves through framework-language and security modules.",

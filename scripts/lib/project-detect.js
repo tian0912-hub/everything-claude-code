@@ -79,6 +79,11 @@ const LANGUAGE_RULES = [
     type: 'php',
     markers: ['composer.json', 'composer.lock'],
     extensions: ['.php']
+  },
+  {
+    type: 'cangjie',
+    markers: ['cjpm.toml', 'oh-package.json5'],
+    extensions: ['.cj']
   }
 ];
 
@@ -124,7 +129,10 @@ const FRAMEWORK_RULES = [
   { framework: 'symfony', language: 'php', markers: ['symfony.lock'], packageKeys: ['symfony/framework-bundle'] },
 
   // Elixir frameworks
-  { framework: 'phoenix', language: 'elixir', markers: [], packageKeys: ['phoenix'] }
+  { framework: 'phoenix', language: 'elixir', markers: [], packageKeys: ['phoenix'] },
+
+  // Cangjie/HarmonyOS frameworks
+  { framework: 'harmonyos', language: 'cangjie', markers: ['oh-package.json5', 'build-profile.json5'], packageKeys: [] }
 ];
 
 /**
