@@ -3,24 +3,29 @@ use crossterm::event::KeyEvent;
 use ratatui::{
     prelude::*,
     widgets::{
-        Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs, Wrap,
+        Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
+        Wrap,
     },
 };
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
 
 use super::widgets::{budget_state, format_currency, format_token_count, BudgetState, TokenMeter};
 use crate::comms;
 use crate::config::{Config, PaneLayout, PaneNavigationAction, Theme};
+use crate::notifications::{DesktopNotifier, NotificationEvent, WebhookNotifier};
 use crate::observability::ToolLogEntry;
 use crate::session::manager;
 use crate::session::output::{
     OutputEvent, OutputLine, OutputStream, SessionOutputStore, OUTPUT_BUFFER_LIMIT,
 };
-use crate::session::store::{DaemonActivity, StateStore};
-use crate::session::{Session, SessionMessage, SessionState};
+use crate::session::store::{DaemonActivity, FileActivityOverlap, StateStore};
+use crate::session::{
+    ContextObservationPriority, DecisionLogEntry, FileActivityEntry, Session, SessionGrouping,
+    SessionBoardMeta, SessionHarnessInfo, SessionMessage, SessionState,
+};
 use crate::worktree;
 
 #[cfg(test)]
@@ -34,11 +39,14 @@ const PANE_RESIZE_STEP_PERCENT: u16 = 5;
 const MAX_LOG_ENTRIES: u64 = 12;
 const MAX_DIFF_PREVIEW_LINES: usize = 6;
 const MAX_DIFF_PATCH_LINES: usize = 80;
+const MAX_METRICS_GRAPH_RELATIONS: usize = 6;
+const MAX_FILE_ACTIVITY_PATCH_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeDiffColumns {
-    removals: String,
-    additions: String,
+    removals: Text<'static>,
+    additions: Text<'static>,
+    hunk_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,17 +57,43 @@ struct ThemePalette {
     help_border: Color,
 }
 
+#[derive(Debug, Clone)]
+struct SessionCompletionSummary {
+    session_id: String,
+    task: String,
+    state: SessionState,
+    files_changed: u32,
+    tokens_used: u64,
+    duration_secs: u64,
+    cost_usd: f64,
+    tests_run: usize,
+    tests_passed: usize,
+    recent_files: Vec<String>,
+    key_decisions: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TestRunSummary {
+    total: usize,
+    passed: usize,
+}
+
 pub struct Dashboard {
     db: StateStore,
     cfg: Config,
     output_store: SessionOutputStore,
     output_rx: broadcast::Receiver<OutputEvent>,
+    notifier: DesktopNotifier,
+    webhook_notifier: WebhookNotifier,
     sessions: Vec<Session>,
+    session_harnesses: HashMap<String, SessionHarnessInfo>,
     session_output_cache: HashMap<String, Vec<OutputLine>>,
     unread_message_counts: HashMap<String, usize>,
     approval_queue_counts: HashMap<String, usize>,
     approval_queue_preview: Vec<SessionMessage>,
     handoff_backlog_counts: HashMap<String, usize>,
+    board_meta_by_session: HashMap<String, SessionBoardMeta>,
     worktree_health_by_session: HashMap<String, worktree::WorktreeHealth>,
     global_handoff_backlog_leads: usize,
     global_handoff_backlog_messages: usize,
@@ -74,9 +108,20 @@ pub struct Dashboard {
     selected_diff_summary: Option<String>,
     selected_diff_preview: Vec<String>,
     selected_diff_patch: Option<String>,
+    selected_diff_hunk_offsets_unified: Vec<usize>,
+    selected_diff_hunk_offsets_split: Vec<usize>,
+    selected_diff_hunk: usize,
+    diff_view_mode: DiffViewMode,
     selected_conflict_protocol: Option<String>,
     selected_merge_readiness: Option<worktree::MergeReadiness>,
+    selected_git_status_entries: Vec<worktree::GitStatusEntry>,
+    selected_git_status: usize,
+    selected_git_patch: Option<worktree::GitStatusPatchView>,
+    selected_git_patch_hunk_offsets_unified: Vec<usize>,
+    selected_git_patch_hunk_offsets_split: Vec<usize>,
+    selected_git_patch_hunk: usize,
     output_mode: OutputMode,
+    graph_entity_filter: GraphEntityFilter,
     output_filter: OutputFilter,
     output_time_filter: OutputTimeFilter,
     timeline_event_filter: TimelineEventFilter,
@@ -95,22 +140,32 @@ pub struct Dashboard {
     collapsed_panes: HashSet<Pane>,
     search_input: Option<String>,
     spawn_input: Option<String>,
+    commit_input: Option<String>,
+    pr_input: Option<String>,
     search_query: Option<String>,
     search_scope: SearchScope,
     search_agent_filter: SearchAgentFilter,
     search_matches: Vec<SearchMatch>,
     selected_search_match: usize,
+    active_completion_popup: Option<SessionCompletionSummary>,
+    queued_completion_popups: VecDeque<SessionCompletionSummary>,
     session_table_state: TableState,
     last_cost_metrics_signature: Option<(u64, u128)>,
+    last_tool_activity_signature: Option<(u64, u128)>,
     last_budget_alert_state: BudgetState,
+    last_session_states: HashMap<String, SessionState>,
+    last_seen_approval_message_id: Option<i64>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SessionSummary {
     total: usize,
+    projects: usize,
+    task_groups: usize,
     pending: usize,
     running: usize,
     idle: usize,
+    stale: usize,
     completed: usize,
     failed: usize,
     stopped: usize,
@@ -125,6 +180,7 @@ enum Pane {
     Sessions,
     Output,
     Metrics,
+    Board,
     Log,
 }
 
@@ -132,8 +188,26 @@ enum Pane {
 enum OutputMode {
     SessionOutput,
     Timeline,
+    ContextGraph,
     WorktreeDiff,
     ConflictProtocol,
+    GitStatus,
+    GitPatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphEntityFilter {
+    All,
+    Decisions,
+    Files,
+    Functions,
+    Sessions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffViewMode {
+    Split,
+    Unified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +233,7 @@ enum TimelineEventFilter {
     Messages,
     ToolCalls,
     FileChanges,
+    Decisions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,12 +262,27 @@ struct SearchMatch {
     line_index: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphDisplayLine {
+    session_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrPromptSpec {
+    title: String,
+    base_branch: Option<String>,
+    labels: Vec<String>,
+    reviewers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineEventType {
     Lifecycle,
     Message,
     ToolCall,
     FileChange,
+    Decision,
 }
 
 #[derive(Debug, Clone)]
@@ -201,19 +291,35 @@ struct TimelineEvent {
     session_id: String,
     event_type: TimelineEventType,
     summary: String,
+    detail_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SpawnRequest {
-    requested_count: usize,
-    task: String,
+enum SpawnRequest {
+    AdHoc {
+        requested_count: usize,
+        task: String,
+    },
+    Template {
+        name: String,
+        task: Option<String>,
+        variables: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SpawnPlan {
-    requested_count: usize,
-    spawn_count: usize,
-    task: String,
+enum SpawnPlan {
+    AdHoc {
+        requested_count: usize,
+        spawn_count: usize,
+        task: String,
+    },
+    Template {
+        name: String,
+        task: Option<String>,
+        variables: BTreeMap<String, String>,
+        step_count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,7 +335,7 @@ impl PaneAreas {
         match pane {
             Pane::Sessions => self.sessions = area,
             Pane::Output => self.output = Some(area),
-            Pane::Metrics => self.metrics = Some(area),
+            Pane::Metrics | Pane::Board => self.metrics = Some(area),
             Pane::Log => self.log = Some(area),
         }
     }
@@ -265,8 +371,134 @@ struct TeamSummary {
     idle: usize,
     running: usize,
     pending: usize,
+    stale: usize,
     failed: usize,
     stopped: usize,
+}
+
+impl SessionCompletionSummary {
+    fn title(&self) -> String {
+        match self.state {
+            SessionState::Completed => "ECC 2.0: Session completed".to_string(),
+            SessionState::Failed => "ECC 2.0: Session failed".to_string(),
+            _ => "ECC 2.0: Session summary".to_string(),
+        }
+    }
+
+    fn subtitle(&self) -> String {
+        format!(
+            "{} | {}",
+            format_session_id(&self.session_id),
+            truncate_for_dashboard(&self.task, 88)
+        )
+    }
+
+    fn notification_body(&self) -> String {
+        let tests_line = if self.tests_run > 0 {
+            format!(
+                "Tests {} run / {} passed",
+                self.tests_run, self.tests_passed
+            )
+        } else {
+            "Tests not detected".to_string()
+        };
+
+        let warnings_line = if self.warnings.is_empty() {
+            "Warnings none".to_string()
+        } else {
+            format!(
+                "Warnings {}",
+                truncate_for_dashboard(&self.warnings.join("; "), 88)
+            )
+        };
+
+        [
+            self.subtitle(),
+            format!(
+                "Files {} | Tokens {} | Duration {}",
+                self.files_changed,
+                format_token_count(self.tokens_used),
+                format_duration(self.duration_secs)
+            ),
+            tests_line,
+            warnings_line,
+        ]
+        .join("\n")
+    }
+
+    fn popup_text(&self) -> String {
+        let mut lines = vec![
+            self.subtitle(),
+            String::new(),
+            format!(
+                "Files {} | Tokens {} | Cost {} | Duration {}",
+                self.files_changed,
+                format_token_count(self.tokens_used),
+                format_currency(self.cost_usd),
+                format_duration(self.duration_secs)
+            ),
+        ];
+
+        if self.tests_run > 0 {
+            lines.push(format!(
+                "Tests {} run / {} passed",
+                self.tests_run, self.tests_passed
+            ));
+        } else {
+            lines.push("Tests not detected".to_string());
+        }
+
+        if !self.recent_files.is_empty() {
+            lines.push(String::new());
+            lines.push("Recent files".to_string());
+            for item in &self.recent_files {
+                lines.push(format!("- {item}"));
+            }
+        }
+
+        if !self.key_decisions.is_empty() {
+            lines.push(String::new());
+            lines.push("Key decisions".to_string());
+            for item in &self.key_decisions {
+                lines.push(format!("- {item}"));
+            }
+        }
+
+        if !self.warnings.is_empty() {
+            lines.push(String::new());
+            lines.push("Warnings".to_string());
+            for item in &self.warnings {
+                lines.push(format!("- {item}"));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("[Enter]/[Space]/[Esc] dismiss".to_string());
+        lines.join("\n")
+    }
+}
+
+fn load_session_harnesses(
+    db: &StateStore,
+    cfg: &Config,
+    sessions: &[Session],
+) -> HashMap<String, SessionHarnessInfo> {
+    let working_dirs = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session.working_dir.as_path()))
+        .collect::<HashMap<_, _>>();
+    db.list_session_harnesses()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(session_id, info)| {
+            let info = if let Some(working_dir) = working_dirs.get(session_id.as_str()) {
+                info.with_config_detection(cfg, working_dir)
+            } else {
+                info
+            };
+            (session_id, info)
+        })
+        .collect()
 }
 
 impl Dashboard {
@@ -280,13 +512,30 @@ impl Dashboard {
         output_store: SessionOutputStore,
     ) -> Self {
         let pane_size_percent = configured_pane_size(&cfg, cfg.pane_layout);
-        let initial_cost_metrics_signature = cost_metrics_signature(&cfg.cost_metrics_path());
+        let initial_cost_metrics_signature = metrics_file_signature(&cfg.cost_metrics_path());
+        let initial_tool_activity_signature =
+            metrics_file_signature(&cfg.tool_activity_metrics_path());
         let _ = db.refresh_session_durations();
         if initial_cost_metrics_signature.is_some() {
             let _ = db.sync_cost_tracker_metrics(&cfg.cost_metrics_path());
         }
+        if initial_tool_activity_signature.is_some() {
+            let _ = db.sync_tool_activity_metrics(&cfg.tool_activity_metrics_path());
+        }
         let sessions = db.list_sessions().unwrap_or_default();
+        let session_harnesses = load_session_harnesses(&db, &cfg, &sessions);
+        let initial_session_states = sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.state.clone()))
+            .collect();
+        let initial_approval_message_id = db
+            .latest_unread_approval_message()
+            .ok()
+            .flatten()
+            .map(|message| message.id);
         let output_rx = output_store.subscribe();
+        let notifier = DesktopNotifier::new(cfg.desktop_notifications.clone());
+        let webhook_notifier = WebhookNotifier::new(cfg.webhook_notifications.clone());
         let mut session_table_state = TableState::default();
         if !sessions.is_empty() {
             session_table_state.select(Some(0));
@@ -297,12 +546,16 @@ impl Dashboard {
             cfg,
             output_store,
             output_rx,
+            notifier,
+            webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
             approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
+            board_meta_by_session: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
             global_handoff_backlog_messages: 0,
@@ -317,9 +570,20 @@ impl Dashboard {
             selected_diff_summary: None,
             selected_diff_preview: Vec::new(),
             selected_diff_patch: None,
+            selected_diff_hunk_offsets_unified: Vec::new(),
+            selected_diff_hunk_offsets_split: Vec::new(),
+            selected_diff_hunk: 0,
+            diff_view_mode: DiffViewMode::Split,
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
+            selected_git_status_entries: Vec::new(),
+            selected_git_status: 0,
+            selected_git_patch: None,
+            selected_git_patch_hunk_offsets_unified: Vec::new(),
+            selected_git_patch_hunk_offsets_split: Vec::new(),
+            selected_git_patch_hunk: 0,
             output_mode: OutputMode::SessionOutput,
+            graph_entity_filter: GraphEntityFilter::All,
             output_filter: OutputFilter::All,
             output_time_filter: OutputTimeFilter::AllTime,
             timeline_event_filter: TimelineEventFilter::All,
@@ -338,17 +602,27 @@ impl Dashboard {
             collapsed_panes: HashSet::new(),
             search_input: None,
             spawn_input: None,
+            commit_input: None,
+            pr_input: None,
             search_query: None,
             search_scope: SearchScope::SelectedSession,
             search_agent_filter: SearchAgentFilter::AllAgents,
             search_matches: Vec::new(),
             selected_search_match: 0,
+            active_completion_popup: None,
+            queued_completion_popups: VecDeque::new(),
             session_table_state,
             last_cost_metrics_signature: initial_cost_metrics_signature,
+            last_tool_activity_signature: initial_tool_activity_signature,
             last_budget_alert_state: BudgetState::Normal,
+            last_session_states: initial_session_states,
+            last_seen_approval_message_id: initial_approval_message_id,
         };
+        sort_sessions_for_display(&mut dashboard.sessions);
         dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap_or_default();
+        dashboard.sync_approval_queue();
         dashboard.sync_handoff_backlog_counts();
+        dashboard.sync_board_meta();
         dashboard.sync_global_handoff_backlog();
         dashboard.sync_selected_output();
         dashboard.sync_selected_diff();
@@ -389,6 +663,10 @@ impl Dashboard {
         }
 
         self.render_status_bar(frame, chunks[2]);
+
+        if let Some(summary) = self.active_completion_popup.as_ref() {
+            self.render_completion_popup(frame, summary);
+        }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -463,9 +741,27 @@ impl Dashboard {
 
         frame.render_widget(Paragraph::new(overview_lines), chunks[0]);
 
+        let mut previous_project: Option<&str> = None;
+        let mut previous_task_group: Option<&str> = None;
         let rows = self.sessions.iter().map(|session| {
+            let project_cell = if previous_project == Some(session.project.as_str()) {
+                None
+            } else {
+                previous_project = Some(session.project.as_str());
+                previous_task_group = None;
+                Some(session.project.clone())
+            };
+            let task_group_cell = if previous_task_group == Some(session.task_group.as_str()) {
+                None
+            } else {
+                previous_task_group = Some(session.task_group.as_str());
+                Some(session.task_group.clone())
+            };
+
             session_row(
                 session,
+                project_cell,
+                task_group_cell,
                 self.approval_queue_counts
                     .get(&session.id)
                     .copied()
@@ -478,6 +774,8 @@ impl Dashboard {
         });
         let header = Row::new([
             "ID",
+            "Project",
+            "Group",
             "Agent",
             "State",
             "Branch",
@@ -491,6 +789,8 @@ impl Dashboard {
         .style(Style::default().add_modifier(Modifier::BOLD));
         let widths = [
             Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(18),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Min(12),
@@ -529,8 +829,12 @@ impl Dashboard {
         self.sync_output_scroll(area.height.saturating_sub(2) as usize);
 
         if self.sessions.get(self.selected_session).is_some()
-            && self.output_mode == OutputMode::WorktreeDiff
-            && self.selected_diff_patch.is_some()
+            && matches!(
+                self.output_mode,
+                OutputMode::WorktreeDiff | OutputMode::GitPatch
+            )
+            && self.active_patch_text().is_some()
+            && self.diff_view_mode == DiffViewMode::Split
         {
             self.render_split_diff_output(frame, area);
             return;
@@ -563,27 +867,65 @@ impl Dashboard {
                     };
                     (self.output_title(), content)
                 }
+                OutputMode::ContextGraph => {
+                    let lines = self.visible_graph_lines();
+                    let content = if lines.is_empty() {
+                        Text::from(self.empty_graph_message())
+                    } else if self.search_query.is_some() {
+                        self.render_searchable_graph(&lines)
+                    } else {
+                        Text::from(
+                            lines
+                                .into_iter()
+                                .map(|line| Line::from(line.text))
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    (self.output_title(), content)
+                }
                 OutputMode::WorktreeDiff => {
-                    let content = self
-                        .selected_diff_patch
-                        .clone()
-                        .or_else(|| {
-                            self.selected_diff_summary.as_ref().map(|summary| {
-                                format!(
-                                    "{summary}\n\nNo patch content to preview yet. The worktree may be clean or only have summary-level changes."
-                                )
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            "No worktree diff available for the selected session.".to_string()
-                        });
-                    (" Diff ".to_string(), Text::from(content))
+                    let content = if let Some(patch) = self.selected_diff_patch.as_ref() {
+                        build_unified_diff_text(patch, self.theme_palette())
+                    } else {
+                        Text::from(
+                            self.selected_diff_summary
+                                .as_ref()
+                                .map(|summary| {
+                                    format!(
+                                        "{summary}\n\nNo patch content to preview yet. The worktree may be clean or only have summary-level changes."
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    "No worktree diff available for the selected session."
+                                        .to_string()
+                                }),
+                        )
+                    };
+                    (self.output_title(), content)
+                }
+                OutputMode::GitPatch => {
+                    let content = if let Some(patch) = self.selected_git_patch.as_ref() {
+                        build_unified_diff_text(&patch.patch, self.theme_palette())
+                    } else {
+                        Text::from(
+                            "No selected-file patch available for the current git-status entry.",
+                        )
+                    };
+                    (self.output_title(), content)
                 }
                 OutputMode::ConflictProtocol => {
                     let content = self.selected_conflict_protocol.clone().unwrap_or_else(|| {
                         "No conflicted worktree available for the selected session.".to_string()
                     });
                     (" Conflict Protocol ".to_string(), Text::from(content))
+                }
+                OutputMode::GitStatus => {
+                    let content = if self.selected_git_status_entries.is_empty() {
+                        Text::from(self.empty_git_status_message())
+                    } else {
+                        Text::from(self.visible_git_status_lines())
+                    };
+                    (self.output_title(), content)
                 }
             }
         } else {
@@ -607,7 +949,7 @@ impl Dashboard {
     fn render_split_diff_output(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Diff ")
+            .title(self.output_title())
             .border_style(self.pane_border_style(Pane::Output));
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
@@ -616,10 +958,10 @@ impl Dashboard {
             return;
         }
 
-        let Some(patch) = self.selected_diff_patch.as_ref() else {
+        let Some(patch) = self.active_patch_text() else {
             return;
         };
-        let columns = build_worktree_diff_columns(patch);
+        let columns = build_worktree_diff_columns(patch, self.theme_palette());
         let column_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -646,6 +988,67 @@ impl Dashboard {
                 self.timeline_event_filter.title_suffix(),
                 self.output_time_filter.title_suffix()
             );
+        }
+
+        if self.output_mode == OutputMode::ContextGraph {
+            let scope = self.search_scope.title_suffix();
+            let filter = self.graph_entity_filter.title_suffix();
+            let time = self.output_time_filter.title_suffix();
+            if let Some(input) = self.search_input.as_ref() {
+                return format!(" Graph{scope}{filter}{time} /{input}_ ");
+            }
+            if let Some(query) = self.search_query.as_ref() {
+                let total = self.search_matches.len();
+                let current = if total == 0 {
+                    0
+                } else {
+                    self.selected_search_match.min(total.saturating_sub(1)) + 1
+                };
+                return format!(" Graph{scope}{filter}{time} /{query} {current}/{total} ");
+            }
+            return format!(" Graph{scope}{filter}{time} ");
+        }
+
+        if self.output_mode == OutputMode::WorktreeDiff {
+            return format!(
+                " Diff{}{} ",
+                self.diff_view_mode.title_suffix(),
+                self.diff_hunk_title_suffix()
+            );
+        }
+
+        if self.output_mode == OutputMode::GitPatch {
+            let path = self
+                .selected_git_patch
+                .as_ref()
+                .map(|patch| patch.display_path.as_str())
+                .unwrap_or("selected file");
+            return format!(
+                " Git patch {}{}{} ",
+                path,
+                self.diff_view_mode.title_suffix(),
+                self.diff_hunk_title_suffix()
+            );
+        }
+
+        if self.output_mode == OutputMode::GitStatus {
+            let staged = self
+                .selected_git_status_entries
+                .iter()
+                .filter(|entry| entry.staged)
+                .count();
+            let unstaged = self
+                .selected_git_status_entries
+                .iter()
+                .filter(|entry| entry.unstaged || entry.untracked)
+                .count();
+            let total = self.selected_git_status_entries.len();
+            let current = if total == 0 {
+                0
+            } else {
+                self.selected_git_status.min(total.saturating_sub(1)) + 1
+            };
+            return format!(" Git status staged:{staged} unstaged:{unstaged} {current}/{total} ");
         }
 
         let filter = format!(
@@ -693,6 +1096,10 @@ impl Dashboard {
         }
     }
 
+    fn empty_git_status_message(&self) -> &'static str {
+        "No staged or unstaged changes for this worktree."
+    }
+
     fn empty_timeline_message(&self) -> &'static str {
         match (
             self.timeline_scope,
@@ -722,6 +1129,11 @@ impl Dashboard {
                 TimelineEventFilter::FileChanges,
                 OutputTimeFilter::AllTime,
             ) => "No file-change events across all sessions yet.",
+            (
+                SearchScope::AllSessions,
+                TimelineEventFilter::Decisions,
+                OutputTimeFilter::AllTime,
+            ) => "No decision-log events across all sessions yet.",
             (SearchScope::AllSessions, TimelineEventFilter::All, _) => {
                 "No timeline events across all sessions in the selected time range."
             }
@@ -736,6 +1148,9 @@ impl Dashboard {
             }
             (SearchScope::AllSessions, TimelineEventFilter::FileChanges, _) => {
                 "No file-change events across all sessions in the selected time range."
+            }
+            (SearchScope::AllSessions, TimelineEventFilter::Decisions, _) => {
+                "No decision-log events across all sessions in the selected time range."
             }
             (SearchScope::SelectedSession, TimelineEventFilter::All, OutputTimeFilter::AllTime) => {
                 "No timeline events for this session yet."
@@ -760,6 +1175,11 @@ impl Dashboard {
                 TimelineEventFilter::FileChanges,
                 OutputTimeFilter::AllTime,
             ) => "No file-change events for this session yet.",
+            (
+                SearchScope::SelectedSession,
+                TimelineEventFilter::Decisions,
+                OutputTimeFilter::AllTime,
+            ) => "No decision-log events for this session yet.",
             (SearchScope::SelectedSession, TimelineEventFilter::All, _) => {
                 "No timeline events in the selected time range."
             }
@@ -775,6 +1195,37 @@ impl Dashboard {
             (SearchScope::SelectedSession, TimelineEventFilter::FileChanges, _) => {
                 "No file-change events in the selected time range."
             }
+            (SearchScope::SelectedSession, TimelineEventFilter::Decisions, _) => {
+                "No decision-log events in the selected time range."
+            }
+        }
+    }
+
+    fn empty_graph_message(&self) -> &'static str {
+        match (
+            self.search_scope,
+            self.graph_entity_filter,
+            self.output_time_filter,
+        ) {
+            (SearchScope::SelectedSession, GraphEntityFilter::All, OutputTimeFilter::AllTime) => {
+                "No graph entities for this session yet."
+            }
+            (_, GraphEntityFilter::Decisions, OutputTimeFilter::AllTime) => {
+                "No decision graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Files, OutputTimeFilter::AllTime) => {
+                "No file graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Functions, OutputTimeFilter::AllTime) => {
+                "No function graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Sessions, OutputTimeFilter::AllTime) => {
+                "No session graph entities in the current scope yet."
+            }
+            (SearchScope::AllSessions, GraphEntityFilter::All, OutputTimeFilter::AllTime) => {
+                "No graph entities across all sessions yet."
+            }
+            (_, _, _) => "No graph entities in the selected filter/time range.",
         }
     }
 
@@ -813,15 +1264,67 @@ impl Dashboard {
         )
     }
 
+    fn render_searchable_graph(&self, lines: &[GraphDisplayLine]) -> Text<'static> {
+        let Some(query) = self.search_query.as_deref() else {
+            return Text::from(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.text.clone()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+
+        let active_match = self.search_matches.get(self.selected_search_match);
+
+        Text::from(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    highlight_output_line(
+                        &line.text,
+                        query,
+                        active_match
+                            .map(|search_match| {
+                                search_match.session_id == line.session_id
+                                    && search_match.line_index == index
+                            })
+                            .unwrap_or(false),
+                        self.theme_palette(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn render_metrics(&mut self, frame: &mut Frame, area: Rect) {
+        let side_pane = if self.selected_pane == Pane::Board {
+            Pane::Board
+        } else {
+            Pane::Metrics
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Metrics ")
-            .border_style(self.pane_border_style(Pane::Metrics));
+            .title(match side_pane {
+                Pane::Board => " Board ",
+                _ => " Metrics ",
+            })
+            .border_style(self.pane_border_style(side_pane));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         if inner.is_empty() {
+            return;
+        }
+
+        if side_pane == Pane::Board {
+            frame.render_widget(
+                Paragraph::new(self.board_text())
+                    .scroll((self.metrics_scroll_offset as u16, 0))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            self.sync_metrics_scroll(inner.height as usize);
             return;
         }
 
@@ -835,11 +1338,13 @@ impl Dashboard {
             .split(inner);
 
         let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         frame.render_widget(
             TokenMeter::tokens(
                 "Token Budget",
                 aggregate.total_tokens,
                 self.cfg.token_budget,
+                thresholds,
             ),
             chunks[0],
         );
@@ -848,6 +1353,7 @@ impl Dashboard {
                 "Cost Budget",
                 aggregate.total_cost_usd,
                 self.cfg.cost_budget_usd,
+                thresholds,
             ),
             chunks[1],
         );
@@ -869,15 +1375,31 @@ impl Dashboard {
             self.logs
                 .iter()
                 .map(|entry| {
-                    format!(
-                        "[{}] {} | {}ms | risk {:.0}%\ninput: {}\noutput: {}",
+                    let mut block = format!(
+                        "[{}] {} | {}ms | risk {:.0}%",
                         self.short_timestamp(&entry.timestamp),
                         entry.tool_name,
                         entry.duration_ms,
                         entry.risk_score * 100.0,
+                    );
+                    if !entry.trigger_summary.trim().is_empty() {
+                        block.push_str(&format!(
+                            "\nwhy: {}",
+                            self.log_field(&entry.trigger_summary)
+                        ));
+                    }
+                    if entry.input_params_json.trim() != "{}" {
+                        block.push_str(&format!(
+                            "\nparams: {}",
+                            self.log_field(&entry.input_params_json)
+                        ));
+                    }
+                    block.push_str(&format!(
+                        "\ninput: {}\noutput: {}",
                         self.log_field(&entry.input_summary),
                         self.log_field(&entry.output_summary)
-                    )
+                    ));
+                    block
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -897,15 +1419,23 @@ impl Dashboard {
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let base_text = format!(
-            " [n]ew session  natural spawn [N]  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  approval jump [I]  [g]lobal dispatch  coordinate [G]lobal  collapse pane [h]  restore panes [H]  timeline [y]  timeline filter [E]  [v]iew diff  conflict proto[c]ol  cont[e]nt filter  time [f]ilter  scope [A]  agent filter [o]  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [{}] focus pane  [Tab] cycle pane  [{}] move pane  [j/k] scroll  delegate [ or ]  [Enter] open  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
+            " [n]ew session  natural spawn [N]  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  approval jump [I]  [g]lobal dispatch  coordinate [G]lobal  collapse pane [h]  restore panes [H]  timeline [y]  timeline filter [E]  file patch [v]  git status [z]  stage [S]  unstage [U]  reset [R]  commit [C]  create PR [P]  diff mode [V]  hunks [{{/}}]  conflict proto[c]ol  cont[e]nt filter  time [f]ilter  scope [A]  agent filter [o]  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [{}] focus pane  [Tab] cycle pane  [{}] move pane  [j/k] scroll  delegate [ or ]  [Enter] open  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
             self.pane_focus_shortcuts_label(),
             self.pane_move_shortcuts_label(),
             self.layout_label(),
             self.theme_label()
         );
 
-        let search_prefix = if let Some(input) = self.spawn_input.as_ref() {
+        let search_prefix = if self.active_completion_popup.is_some() {
+            " completion summary | [Enter]/[Space]/[Esc] dismiss |".to_string()
+        } else if let Some(input) = self.spawn_input.as_ref() {
             format!(" spawn>{input}_ | [Enter] queue [Esc] cancel |")
+        } else if let Some(input) = self.commit_input.as_ref() {
+            format!(" commit>{input}_ | [Enter] commit [Esc] cancel |")
+        } else if let Some(input) = self.pr_input.as_ref() {
+            format!(
+                " pr>{input}_ | [Enter] create draft PR | title | base=branch | labels=a,b | reviewers=a,b | [Esc] cancel |"
+            )
         } else if let Some(input) = self.search_input.as_ref() {
             format!(
                 " /{input}_ | {} | {} | [Enter] apply [Esc] cancel |",
@@ -931,7 +1461,10 @@ impl Dashboard {
             String::new()
         };
 
-        let text = if self.spawn_input.is_some()
+        let text = if self.active_completion_popup.is_some()
+            || self.spawn_input.is_some()
+            || self.commit_input.is_some()
+            || self.pr_input.is_some()
             || self.search_input.is_some()
             || self.search_query.is_some()
             || self.pane_command_mode
@@ -974,12 +1507,37 @@ impl Dashboard {
         );
     }
 
+    fn render_completion_popup(&self, frame: &mut Frame, summary: &SessionCompletionSummary) {
+        let popup_area = centered_rect(72, 65, frame.area());
+        if popup_area.is_empty() {
+            return;
+        }
+
+        frame.render_widget(Clear, popup_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", summary.title()))
+            .border_style(self.pane_border_style(Pane::Output));
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+        if inner.is_empty() {
+            return;
+        }
+
+        frame.render_widget(
+            Paragraph::new(summary.popup_text())
+                .wrap(Wrap { trim: true })
+                .scroll((0, 0)),
+            inner,
+        );
+    }
+
     fn render_help(&self, frame: &mut Frame, area: Rect) {
         let help = vec![
             "Keyboard Shortcuts:".to_string(),
             "".to_string(),
             "  n       New session".to_string(),
-            "  N       Natural-language multi-agent spawn prompt".to_string(),
+            "  N       Natural-language multi-agent or template spawn prompt".to_string(),
             "  a       Assign follow-up work from selected session".to_string(),
             "  b       Rebalance backed-up delegate handoff backlog for selected lead".to_string(),
             "  B       Rebalance backed-up delegate handoff backlog across lead teams".to_string(),
@@ -987,16 +1545,24 @@ impl Dashboard {
             "  I       Jump to the next unread approval/conflict target session".to_string(),
             "  g       Auto-dispatch unread handoffs across lead sessions".to_string(),
             "  G       Dispatch then rebalance backlog across lead teams".to_string(),
+            "  K       Toggle selected-session context graph view".to_string(),
             "  h       Collapse the focused non-session pane".to_string(),
             "  H       Restore all collapsed panes".to_string(),
             "  y       Toggle selected-session timeline view".to_string(),
-            "  E       Cycle timeline event filter".to_string(),
-            "  v       Toggle selected worktree diff in output pane".to_string(),
+            "  E       Cycle timeline event filter or graph entity filter".to_string(),
+            "  v       Toggle selected worktree diff or selected-file patch in output pane"
+                .to_string(),
+            "  z       Toggle selected worktree git status in output pane".to_string(),
+            "  V       Toggle diff view mode between split and unified".to_string(),
+            "  {/}     Jump to previous/next diff hunk in the active diff view".to_string(),
+            "  S/U/R   Stage, unstage, or reset the selected file or active diff hunk".to_string(),
+            "  C       Commit staged changes for the selected worktree".to_string(),
+            "  P       Create a draft PR; supports title | base=branch | labels=a,b | reviewers=a,b".to_string(),
             "  c       Show conflict-resolution protocol for selected conflicted worktree"
                 .to_string(),
             "  e       Cycle output content filter: all/errors/tool calls/file changes".to_string(),
             "  f       Cycle output or timeline time range between all/15m/1h/24h".to_string(),
-            "  A       Toggle search or timeline scope between selected session and all sessions"
+            "  A       Toggle search, graph, or timeline scope between selected session and all sessions"
                 .to_string(),
             "  o       Toggle search agent filter between all agents and selected agent type"
                 .to_string(),
@@ -1030,7 +1596,7 @@ impl Dashboard {
             "  k/↑     Scroll up".to_string(),
             "  [ or ]  Focus previous/next delegate in lead Metrics board".to_string(),
             "  Enter   Open focused delegate from lead Metrics board".to_string(),
-            "  /       Search current session output".to_string(),
+            "  /       Search session output or graph lines".to_string(),
             "  n/N     Next/previous search match when search is active".to_string(),
             "  Esc     Clear active search or cancel search input".to_string(),
             "  +/=     Increase pane size and persist it".to_string(),
@@ -1077,7 +1643,7 @@ impl Dashboard {
             return;
         };
 
-        if !self.visible_panes().contains(&target) {
+        if !self.is_pane_visible(target) {
             self.set_operator_note(format!(
                 "{} pane is not visible",
                 target.title().to_lowercase()
@@ -1159,6 +1725,7 @@ impl Dashboard {
             crossterm::event::KeyCode::Char('2') => self.focus_pane_number(2),
             crossterm::event::KeyCode::Char('3') => self.focus_pane_number(3),
             crossterm::event::KeyCode::Char('4') => self.focus_pane_number(4),
+            crossterm::event::KeyCode::Char('5') => self.focus_pane_number(5),
             crossterm::event::KeyCode::Char('+') | crossterm::event::KeyCode::Char('=') => {
                 self.increase_pane_size()
             }
@@ -1454,6 +2021,14 @@ impl Dashboard {
                 self.refresh_logs();
             }
             Pane::Output => {
+                if self.output_mode == OutputMode::GitStatus {
+                    self.output_follow = false;
+                    if self.selected_git_status + 1 < self.selected_git_status_entries.len() {
+                        self.selected_git_status += 1;
+                        self.sync_output_scroll(self.last_output_height.max(1));
+                    }
+                    return;
+                }
                 let max_scroll = self.max_output_scroll();
                 if self.output_follow {
                     return;
@@ -1466,7 +2041,7 @@ impl Dashboard {
                     self.output_scroll_offset = self.output_scroll_offset.saturating_add(1);
                 }
             }
-            Pane::Metrics => {
+            Pane::Metrics | Pane::Board => {
                 let max_scroll = self.max_metrics_scroll();
                 self.metrics_scroll_offset =
                     self.metrics_scroll_offset.saturating_add(1).min(max_scroll);
@@ -1493,6 +2068,12 @@ impl Dashboard {
                 self.refresh_logs();
             }
             Pane::Output => {
+                if self.output_mode == OutputMode::GitStatus {
+                    self.output_follow = false;
+                    self.selected_git_status = self.selected_git_status.saturating_sub(1);
+                    self.sync_output_scroll(self.last_output_height.max(1));
+                    return;
+                }
                 if self.output_follow {
                     self.output_follow = false;
                     self.output_scroll_offset = self.max_output_scroll();
@@ -1500,7 +2081,7 @@ impl Dashboard {
 
                 self.output_scroll_offset = self.output_scroll_offset.saturating_sub(1);
             }
-            Pane::Metrics => {
+            Pane::Metrics | Pane::Board => {
                 self.metrics_scroll_offset = self.metrics_scroll_offset.saturating_sub(1);
             }
             Pane::Log => {
@@ -1590,13 +2171,22 @@ impl Dashboard {
 
         let task = self.new_session_task();
         let agent = self.cfg.default_agent.clone();
+        let grouping = self
+            .sessions
+            .get(self.selected_session)
+            .map(|session| SessionGrouping {
+                project: Some(session.project.clone()),
+                task_group: Some(session.task_group.clone()),
+            })
+            .unwrap_or_default();
 
-        let session_id = match manager::create_session(
+        let session_id = match manager::create_session_with_grouping(
             &self.db,
             &self.cfg,
             &task,
             &agent,
             self.cfg.auto_create_worktrees,
+            grouping,
         )
         .await
         {
@@ -1631,6 +2221,7 @@ impl Dashboard {
                 &comms::MessageType::TaskHandoff {
                     task: source_session.task.clone(),
                     context,
+                    priority: comms::TaskPriority::Normal,
                 },
             ) {
                 tracing::warn!(
@@ -1643,10 +2234,21 @@ impl Dashboard {
 
         self.refresh();
         self.sync_selection_by_id(Some(&session_id));
-        self.set_operator_note(format!(
-            "spawned session {}",
-            format_session_id(&session_id)
-        ));
+        let queued_for_worktree = self
+            .db
+            .pending_worktree_queue_contains(&session_id)
+            .unwrap_or(false);
+        if queued_for_worktree {
+            self.set_operator_note(format!(
+                "queued session {} pending worktree slot",
+                format_session_id(&session_id)
+            ));
+        } else {
+            self.set_operator_note(format!(
+                "spawned session {}",
+                format_session_id(&session_id)
+            ));
+        }
         self.reset_output_view();
         self.sync_selected_output();
         self.sync_selected_diff();
@@ -1663,7 +2265,7 @@ impl Dashboard {
                     self.output_mode = OutputMode::WorktreeDiff;
                     self.selected_pane = Pane::Output;
                     self.output_follow = false;
-                    self.output_scroll_offset = 0;
+                    self.output_scroll_offset = self.current_diff_hunk_offset();
                     self.set_operator_note("showing selected worktree diff".to_string());
                 } else {
                     self.set_operator_note("no worktree diff for selected session".to_string());
@@ -1679,12 +2281,327 @@ impl Dashboard {
                 self.reset_output_view();
                 self.set_operator_note("showing session output".to_string());
             }
+            OutputMode::ContextGraph => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
             OutputMode::ConflictProtocol => {
                 self.output_mode = OutputMode::SessionOutput;
                 self.reset_output_view();
                 self.set_operator_note("showing session output".to_string());
             }
+            OutputMode::GitStatus => {
+                self.sync_selected_git_patch();
+                if self.selected_git_patch.is_some() {
+                    self.output_mode = OutputMode::GitPatch;
+                    self.selected_pane = Pane::Output;
+                    self.output_follow = false;
+                    self.output_scroll_offset = self.current_diff_hunk_offset();
+                    self.set_operator_note("showing selected file patch".to_string());
+                } else {
+                    self.set_operator_note(
+                        "no patch hunks available for the selected git-status entry".to_string(),
+                    );
+                }
+            }
+            OutputMode::GitPatch => {
+                self.output_mode = OutputMode::GitStatus;
+                self.output_follow = false;
+                self.sync_output_scroll(self.last_output_height.max(1));
+                self.set_operator_note("showing selected worktree git status".to_string());
+            }
         }
+    }
+
+    pub fn toggle_git_status_mode(&mut self) {
+        match self.output_mode {
+            OutputMode::GitStatus | OutputMode::GitPatch => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
+            _ => {
+                let has_worktree = self
+                    .sessions
+                    .get(self.selected_session)
+                    .and_then(|session| session.worktree.as_ref())
+                    .is_some();
+                if !has_worktree {
+                    self.set_operator_note("selected session has no worktree".to_string());
+                    return;
+                }
+
+                self.sync_selected_git_status();
+                self.output_mode = OutputMode::GitStatus;
+                self.selected_pane = Pane::Output;
+                self.output_follow = false;
+                self.sync_output_scroll(self.last_output_height.max(1));
+                self.set_operator_note("showing selected worktree git status".to_string());
+            }
+        }
+    }
+
+    pub fn stage_selected_git_status(&mut self) {
+        if self.output_mode == OutputMode::GitPatch {
+            self.stage_selected_git_hunk();
+            return;
+        }
+
+        if self.output_mode != OutputMode::GitStatus {
+            self.set_operator_note(
+                "git staging controls are only available in git status view".to_string(),
+            );
+            return;
+        }
+
+        let Some((entry, worktree)) = self.selected_git_status_context() else {
+            self.set_operator_note("no git status entry selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::stage_path(&worktree, &entry.path) {
+            tracing::warn!("Failed to stage {}: {error}", entry.path);
+            self.set_operator_note(format!("stage failed for {}: {error}", entry.display_path));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("staged {}", entry.display_path));
+    }
+
+    pub fn unstage_selected_git_status(&mut self) {
+        if self.output_mode == OutputMode::GitPatch {
+            self.unstage_selected_git_hunk();
+            return;
+        }
+
+        if self.output_mode != OutputMode::GitStatus {
+            self.set_operator_note(
+                "git staging controls are only available in git status view".to_string(),
+            );
+            return;
+        }
+
+        let Some((entry, worktree)) = self.selected_git_status_context() else {
+            self.set_operator_note("no git status entry selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::unstage_path(&worktree, &entry.path) {
+            tracing::warn!("Failed to unstage {}: {error}", entry.path);
+            self.set_operator_note(format!(
+                "unstage failed for {}: {error}",
+                entry.display_path
+            ));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("unstaged {}", entry.display_path));
+    }
+
+    pub fn reset_selected_git_status(&mut self) {
+        if self.output_mode == OutputMode::GitPatch {
+            self.reset_selected_git_hunk();
+            return;
+        }
+
+        if self.output_mode != OutputMode::GitStatus {
+            self.set_operator_note(
+                "git staging controls are only available in git status view".to_string(),
+            );
+            return;
+        }
+
+        let Some((entry, worktree)) = self.selected_git_status_context() else {
+            self.set_operator_note("no git status entry selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::reset_path(&worktree, &entry) {
+            tracing::warn!("Failed to reset {}: {error}", entry.path);
+            self.set_operator_note(format!("reset failed for {}: {error}", entry.display_path));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("reset {}", entry.display_path));
+    }
+
+    pub fn begin_commit_prompt(&mut self) {
+        if !matches!(
+            self.output_mode,
+            OutputMode::GitStatus | OutputMode::GitPatch
+        ) {
+            self.set_operator_note(
+                "commit prompt is only available in git status view".to_string(),
+            );
+            return;
+        }
+
+        if self
+            .sessions
+            .get(self.selected_session)
+            .and_then(|session| session.worktree.as_ref())
+            .is_none()
+        {
+            self.set_operator_note("selected session has no worktree".to_string());
+            return;
+        }
+
+        if !self
+            .selected_git_status_entries
+            .iter()
+            .any(|entry| entry.staged)
+        {
+            self.set_operator_note("no staged changes to commit".to_string());
+            return;
+        }
+
+        self.commit_input = Some(String::new());
+        self.set_operator_note("commit mode | type a message and press Enter".to_string());
+    }
+
+    pub fn begin_pr_prompt(&mut self) {
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            self.set_operator_note("no session selected".to_string());
+            return;
+        };
+        let Some(worktree) = session.worktree.as_ref() else {
+            self.set_operator_note("selected session has no worktree".to_string());
+            return;
+        };
+        if worktree::has_uncommitted_changes(worktree).unwrap_or(false) {
+            self.set_operator_note(
+                "commit or reset worktree changes before creating a PR".to_string(),
+            );
+            return;
+        }
+
+        let seed = worktree::latest_commit_subject(worktree)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| session.task.clone());
+        self.pr_input = Some(seed);
+        self.set_operator_note(
+            "pr mode | title | base=branch | labels=a,b | reviewers=a,b".to_string(),
+        );
+    }
+
+    fn stage_selected_git_hunk(&mut self) {
+        let Some((entry, worktree, _, hunk)) = self.selected_git_patch_context() else {
+            self.set_operator_note("no git hunk selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::stage_hunk(&worktree, &hunk) {
+            tracing::warn!("Failed to stage hunk for {}: {error}", entry.path);
+            self.set_operator_note(format!(
+                "stage hunk failed for {}: {error}",
+                entry.display_path
+            ));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("staged hunk in {}", entry.display_path));
+    }
+
+    fn unstage_selected_git_hunk(&mut self) {
+        let Some((entry, worktree, _, hunk)) = self.selected_git_patch_context() else {
+            self.set_operator_note("no git hunk selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::unstage_hunk(&worktree, &hunk) {
+            tracing::warn!("Failed to unstage hunk for {}: {error}", entry.path);
+            self.set_operator_note(format!(
+                "unstage hunk failed for {}: {error}",
+                entry.display_path
+            ));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("unstaged hunk in {}", entry.display_path));
+    }
+
+    fn reset_selected_git_hunk(&mut self) {
+        let Some((entry, worktree, _, hunk)) = self.selected_git_patch_context() else {
+            self.set_operator_note("no git hunk selected".to_string());
+            return;
+        };
+
+        if let Err(error) = worktree::reset_hunk(&worktree, &entry, &hunk) {
+            tracing::warn!("Failed to reset hunk for {}: {error}", entry.path);
+            self.set_operator_note(format!(
+                "reset hunk failed for {}: {error}",
+                entry.display_path
+            ));
+            return;
+        }
+
+        self.refresh_after_git_status_action(Some(&entry.path));
+        self.set_operator_note(format!("reset hunk in {}", entry.display_path));
+    }
+
+    pub fn toggle_diff_view_mode(&mut self) {
+        if !matches!(
+            self.output_mode,
+            OutputMode::WorktreeDiff | OutputMode::GitPatch
+        ) || self.active_patch_text().is_none()
+        {
+            self.set_operator_note("no active worktree diff view to toggle".to_string());
+            return;
+        }
+
+        self.diff_view_mode = match self.diff_view_mode {
+            DiffViewMode::Split => DiffViewMode::Unified,
+            DiffViewMode::Unified => DiffViewMode::Split,
+        };
+        self.output_follow = false;
+        self.output_scroll_offset = self.current_diff_hunk_offset();
+        self.set_operator_note(format!("diff view set to {}", self.diff_view_mode.label()));
+    }
+
+    pub fn next_diff_hunk(&mut self) {
+        self.move_diff_hunk(1);
+    }
+
+    pub fn prev_diff_hunk(&mut self) {
+        self.move_diff_hunk(-1);
+    }
+
+    fn move_diff_hunk(&mut self, delta: isize) {
+        if !matches!(
+            self.output_mode,
+            OutputMode::WorktreeDiff | OutputMode::GitPatch
+        ) || self.active_patch_text().is_none()
+        {
+            self.set_operator_note("no active worktree diff to navigate".to_string());
+            return;
+        }
+
+        let (len, next_offset) = {
+            let offsets = self.current_diff_hunk_offsets();
+            if offsets.is_empty() {
+                self.set_operator_note("no diff hunks in bounded preview".to_string());
+                return;
+            }
+
+            let len = offsets.len();
+            let next =
+                (self.current_diff_hunk_index() as isize + delta).rem_euclid(len as isize) as usize;
+            (len, offsets[next])
+        };
+
+        let next =
+            (self.current_diff_hunk_index() as isize + delta).rem_euclid(len as isize) as usize;
+        self.set_current_diff_hunk_index(next);
+        self.output_follow = false;
+        self.output_scroll_offset = next_offset;
+        self.set_operator_note(format!("diff hunk {}/{}", next + 1, len));
     }
 
     pub fn toggle_timeline_mode(&mut self) {
@@ -2174,9 +3091,11 @@ impl Dashboard {
             Ok(outcome) => {
                 self.refresh();
                 if outcome.merged.is_empty()
+                    && outcome.rebased.is_empty()
                     && outcome.active_with_worktree_ids.is_empty()
                     && outcome.conflicted_session_ids.is_empty()
                     && outcome.dirty_worktree_ids.is_empty()
+                    && outcome.blocked_by_queue_session_ids.is_empty()
                     && outcome.failures.is_empty()
                 {
                     self.set_operator_note("no ready worktrees to merge".to_string());
@@ -2184,6 +3103,9 @@ impl Dashboard {
                 }
 
                 let mut parts = vec![format!("merged {} ready worktree(s)", outcome.merged.len())];
+                if !outcome.rebased.is_empty() {
+                    parts.push(format!("rebased {}", outcome.rebased.len()));
+                }
                 if !outcome.active_with_worktree_ids.is_empty() {
                     parts.push(format!(
                         "skipped {} active",
@@ -2202,6 +3124,12 @@ impl Dashboard {
                         outcome.dirty_worktree_ids.len()
                     ));
                 }
+                if !outcome.blocked_by_queue_session_ids.is_empty() {
+                    parts.push(format!(
+                        "blocked {} in queue",
+                        outcome.blocked_by_queue_session_ids.len()
+                    ));
+                }
                 if !outcome.failures.is_empty() {
                     parts.push(format!("{} failed", outcome.failures.len()));
                 }
@@ -2215,22 +3143,43 @@ impl Dashboard {
     }
 
     pub async fn prune_inactive_worktrees(&mut self) {
-        match manager::prune_inactive_worktrees(&self.db).await {
+        match manager::prune_inactive_worktrees(&self.db, &self.cfg).await {
             Ok(outcome) => {
                 self.refresh();
-                if outcome.cleaned_session_ids.is_empty() {
+                if outcome.cleaned_session_ids.is_empty() && outcome.retained_session_ids.is_empty()
+                {
                     self.set_operator_note("no inactive worktrees to prune".to_string());
-                } else if outcome.active_with_worktree_ids.is_empty() {
+                } else if outcome.cleaned_session_ids.is_empty() {
                     self.set_operator_note(format!(
-                        "pruned {} inactive worktree(s)",
-                        outcome.cleaned_session_ids.len()
+                        "deferred {} inactive worktree(s) within retention",
+                        outcome.retained_session_ids.len()
                     ));
+                } else if outcome.active_with_worktree_ids.is_empty() {
+                    if outcome.retained_session_ids.is_empty() {
+                        self.set_operator_note(format!(
+                            "pruned {} inactive worktree(s)",
+                            outcome.cleaned_session_ids.len()
+                        ));
+                    } else {
+                        self.set_operator_note(format!(
+                            "pruned {} inactive worktree(s); deferred {} within retention",
+                            outcome.cleaned_session_ids.len(),
+                            outcome.retained_session_ids.len()
+                        ));
+                    }
                 } else {
-                    self.set_operator_note(format!(
+                    let mut note = format!(
                         "pruned {} inactive worktree(s); skipped {} active session(s)",
                         outcome.cleaned_session_ids.len(),
                         outcome.active_with_worktree_ids.len()
-                    ));
+                    );
+                    if !outcome.retained_session_ids.is_empty() {
+                        note.push_str(&format!(
+                            "; deferred {} within retention",
+                            outcome.retained_session_ids.len()
+                        ));
+                    }
+                    self.set_operator_note(note);
                 }
             }
             Err(error) => {
@@ -2271,11 +3220,28 @@ impl Dashboard {
     }
 
     pub fn is_input_mode(&self) -> bool {
-        self.spawn_input.is_some() || self.search_input.is_some()
+        self.spawn_input.is_some()
+            || self.search_input.is_some()
+            || self.commit_input.is_some()
+            || self.pr_input.is_some()
     }
 
     pub fn has_active_search(&self) -> bool {
         self.search_query.is_some()
+    }
+
+    pub fn is_context_graph_mode(&self) -> bool {
+        self.output_mode == OutputMode::ContextGraph
+    }
+
+    pub fn has_active_completion_popup(&self) -> bool {
+        self.active_completion_popup.is_some()
+    }
+
+    pub fn dismiss_completion_popup(&mut self) {
+        if self.active_completion_popup.take().is_some() {
+            self.active_completion_popup = self.queued_completion_popups.pop_front();
+        }
     }
 
     pub fn begin_spawn_prompt(&mut self) {
@@ -2288,7 +3254,7 @@ impl Dashboard {
 
         self.spawn_input = Some(self.spawn_prompt_seed());
         self.set_operator_note(
-            "spawn mode | try: give me 3 agents working on fix flaky tests".to_string(),
+            "spawn mode | try: give me 3 agents working on fix flaky tests | or: template feature_development for fix flaky tests".to_string(),
         );
     }
 
@@ -2303,9 +3269,27 @@ impl Dashboard {
             return;
         }
 
+        if self.output_mode == OutputMode::ContextGraph {
+            self.search_scope = self.search_scope.next();
+            self.recompute_search_matches();
+            self.sync_output_scroll(self.last_output_height.max(1));
+
+            if self.search_query.is_some() {
+                self.set_operator_note(format!(
+                    "graph scope set to {} | {} match(es)",
+                    self.search_scope.label(),
+                    self.search_matches.len()
+                ));
+            } else {
+                self.set_operator_note(format!("graph scope set to {}", self.search_scope.label()));
+            }
+            return;
+        }
+
         if self.output_mode != OutputMode::SessionOutput {
             self.set_operator_note(
-                "scope toggle is only available in session output or timeline view".to_string(),
+                "scope toggle is only available in session output, graph, or timeline view"
+                    .to_string(),
             );
             return;
         }
@@ -2365,19 +3349,33 @@ impl Dashboard {
             return;
         }
 
-        if self.output_mode != OutputMode::SessionOutput {
-            self.set_operator_note("search is only available in session output view".to_string());
+        if !matches!(
+            self.output_mode,
+            OutputMode::SessionOutput | OutputMode::ContextGraph
+        ) {
+            self.set_operator_note(
+                "search is only available in session output or graph view".to_string(),
+            );
             return;
         }
 
         self.search_input = Some(self.search_query.clone().unwrap_or_default());
-        self.set_operator_note("search mode | type a query and press Enter".to_string());
+        let mode = if self.output_mode == OutputMode::ContextGraph {
+            "graph search"
+        } else {
+            "search"
+        };
+        self.set_operator_note(format!("{mode} mode | type a query and press Enter"));
     }
 
     pub fn push_input_char(&mut self, ch: char) {
         if let Some(input) = self.spawn_input.as_mut() {
             input.push(ch);
         } else if let Some(input) = self.search_input.as_mut() {
+            input.push(ch);
+        } else if let Some(input) = self.commit_input.as_mut() {
+            input.push(ch);
+        } else if let Some(input) = self.pr_input.as_mut() {
             input.push(ch);
         }
     }
@@ -2387,6 +3385,10 @@ impl Dashboard {
             input.pop();
         } else if let Some(input) = self.search_input.as_mut() {
             input.pop();
+        } else if let Some(input) = self.commit_input.as_mut() {
+            input.pop();
+        } else if let Some(input) = self.pr_input.as_mut() {
+            input.pop();
         }
     }
 
@@ -2395,14 +3397,118 @@ impl Dashboard {
             self.set_operator_note("spawn input cancelled".to_string());
         } else if self.search_input.take().is_some() {
             self.set_operator_note("search input cancelled".to_string());
+        } else if self.commit_input.take().is_some() {
+            self.set_operator_note("commit input cancelled".to_string());
+        } else if self.pr_input.take().is_some() {
+            self.set_operator_note("pr input cancelled".to_string());
         }
     }
 
     pub async fn submit_input(&mut self) {
         if self.spawn_input.is_some() {
             self.submit_spawn_prompt().await;
+        } else if self.commit_input.is_some() {
+            self.submit_commit_prompt();
+        } else if self.pr_input.is_some() {
+            self.submit_pr_prompt();
         } else {
             self.submit_search();
+        }
+    }
+
+    fn submit_pr_prompt(&mut self) {
+        let Some(input) = self.pr_input.take() else {
+            return;
+        };
+
+        let request = match parse_pr_prompt(&input) {
+            Ok(request) => request,
+            Err(error) => {
+                self.pr_input = Some(input);
+                self.set_operator_note(format!("invalid PR input: {error}"));
+                return;
+            }
+        };
+
+        if request.title.is_empty() {
+            self.pr_input = Some(input);
+            self.set_operator_note("pr title cannot be empty".to_string());
+            return;
+        }
+
+        let Some(session) = self.sessions.get(self.selected_session).cloned() else {
+            self.set_operator_note("no session selected".to_string());
+            return;
+        };
+        let Some(worktree) = session.worktree.clone() else {
+            self.set_operator_note("selected session has no worktree".to_string());
+            return;
+        };
+        if let Ok(true) = worktree::has_uncommitted_changes(&worktree) {
+            self.pr_input = Some(input);
+            self.set_operator_note(
+                "commit or reset worktree changes before creating a PR".to_string(),
+            );
+            return;
+        }
+
+        let body = self.build_pull_request_body(&session);
+        let options = worktree::DraftPrOptions {
+            base_branch: request.base_branch.clone(),
+            labels: request.labels.clone(),
+            reviewers: request.reviewers.clone(),
+        };
+        match worktree::create_draft_pr_with_options(&worktree, &request.title, &body, &options) {
+            Ok(url) => {
+                self.set_operator_note(format!(
+                    "created draft PR for {} against {}: {}",
+                    format_session_id(&session.id),
+                    options
+                        .base_branch
+                        .as_deref()
+                        .unwrap_or(&worktree.base_branch),
+                    url
+                ));
+            }
+            Err(error) => {
+                self.pr_input = Some(input);
+                self.set_operator_note(format!("draft PR failed: {error}"));
+            }
+        }
+    }
+
+    fn submit_commit_prompt(&mut self) {
+        let Some(input) = self.commit_input.take() else {
+            return;
+        };
+
+        let message = input.trim().to_string();
+        let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
+            self.set_operator_note("no session selected".to_string());
+            return;
+        };
+        let Some(worktree) = self
+            .sessions
+            .get(self.selected_session)
+            .and_then(|session| session.worktree.clone())
+        else {
+            self.set_operator_note("selected session has no worktree".to_string());
+            return;
+        };
+
+        match worktree::commit_staged(&worktree, &message) {
+            Ok(hash) => {
+                self.refresh_after_git_status_action(None);
+                self.set_operator_note(format!(
+                    "committed {} as {}",
+                    format_session_id(&session_id),
+                    hash
+                ));
+            }
+            Err(error) => {
+                self.commit_input = Some(input);
+                self.set_operator_note(format!("commit failed: {error}"));
+            }
         }
     }
 
@@ -2426,14 +3532,77 @@ impl Dashboard {
         self.search_query = Some(query.clone());
         self.recompute_search_matches();
         if self.search_matches.is_empty() {
-            self.set_operator_note(format!("search /{query} found no matches"));
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "search"
+            };
+            self.set_operator_note(format!("{mode} /{query} found no matches"));
         } else {
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "search"
+            };
             self.set_operator_note(format!(
-                "search /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
+                "{mode} /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
                 self.search_matches.len(),
                 self.search_match_session_count()
             ));
         }
+    }
+
+    fn build_pull_request_body(&self, session: &Session) -> String {
+        let mut lines = vec![
+            "## Summary".to_string(),
+            format!("- Task: {}", session.task),
+            format!("- Agent: {}", session.agent_type),
+            format!("- Project: {}", session.project),
+            format!("- Task group: {}", session.task_group),
+        ];
+        if let Some(worktree) = session.worktree.as_ref() {
+            lines.push(format!(
+                "- Branch: {} -> {}",
+                worktree.branch, worktree.base_branch
+            ));
+        }
+        if let Some(summary) = self.selected_diff_summary.as_ref() {
+            lines.push(format!("- Diff: {summary}"));
+        }
+        let changed_files = self
+            .selected_diff_preview
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !changed_files.is_empty() {
+            lines.push(String::new());
+            lines.push("## Changed Files".to_string());
+            for file in changed_files {
+                lines.push(format!("- {file}"));
+            }
+        }
+        lines.push(String::new());
+        lines.push("## Session Metrics".to_string());
+        lines.push(format!(
+            "- Tokens: {} total (in {} / out {})",
+            session.metrics.tokens_used,
+            session.metrics.input_tokens,
+            session.metrics.output_tokens
+        ));
+        lines.push(format!("- Tool calls: {}", session.metrics.tool_calls));
+        lines.push(format!(
+            "- Files changed: {}",
+            session.metrics.files_changed
+        ));
+        lines.push(format!(
+            "- Duration: {}",
+            format_duration(session.metrics.duration_secs)
+        ));
+        lines.push(String::new());
+        lines.push("## Testing".to_string());
+        lines.push("- Verified in ECC 2.0 dashboard workflow".to_string());
+        lines.join("\n")
     }
 
     async fn submit_spawn_prompt(&mut self) {
@@ -2470,72 +3639,121 @@ impl Dashboard {
         });
         let source_task = source_session.as_ref().map(|session| session.task.clone());
         let source_session_id = source_session.as_ref().map(|session| session.id.clone());
+        let source_grouping = source_session
+            .as_ref()
+            .map(|session| SessionGrouping {
+                project: Some(session.project.clone()),
+                task_group: Some(session.task_group.clone()),
+            })
+            .unwrap_or_default();
         let agent = self.cfg.default_agent.clone();
         let mut created_ids = Vec::new();
 
-        for task in expand_spawn_tasks(&plan.task, plan.spawn_count) {
-            let session_id = match manager::create_session(
+        match &plan {
+            SpawnPlan::AdHoc {
+                requested_count: _,
+                spawn_count,
+                task,
+            } => {
+                for task in expand_spawn_tasks(task, *spawn_count) {
+                    let session_id = match manager::create_session_with_grouping(
+                        &self.db,
+                        &self.cfg,
+                        &task,
+                        &agent,
+                        self.cfg.auto_create_worktrees,
+                        source_grouping.clone(),
+                    )
+                    .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(error) => {
+                            let preferred_selection =
+                                post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+                            self.refresh_after_spawn(preferred_selection.as_deref());
+                            let mut summary = if created_ids.is_empty() {
+                                format!("spawn failed: {error}")
+                            } else {
+                                format!(
+                                    "spawn partially completed: {} of {} queued before failure: {error}",
+                                    created_ids.len(),
+                                    spawn_count
+                                )
+                            };
+                            if let Some(layout_note) =
+                                self.auto_split_layout_after_spawn(created_ids.len())
+                            {
+                                summary.push_str(" | ");
+                                summary.push_str(&layout_note);
+                            }
+                            self.set_operator_note(summary);
+                            return;
+                        }
+                    };
+
+                    if let (Some(source_id), Some(task), Some(context)) = (
+                        source_session_id.as_ref(),
+                        source_task.as_ref(),
+                        handoff_context.as_ref(),
+                    ) {
+                        if let Err(error) = comms::send(
+                            &self.db,
+                            source_id,
+                            &session_id,
+                            &comms::MessageType::TaskHandoff {
+                                task: task.clone(),
+                                context: context.clone(),
+                                priority: comms::TaskPriority::Normal,
+                            },
+                        ) {
+                            tracing::warn!(
+                                "Failed to send handoff from session {} to {}: {error}",
+                                source_id,
+                                session_id
+                            );
+                        }
+                    }
+
+                    created_ids.push(session_id);
+                }
+            }
+            SpawnPlan::Template {
+                name,
+                task,
+                variables,
+                ..
+            } => match manager::launch_orchestration_template(
                 &self.db,
                 &self.cfg,
-                &task,
-                &agent,
-                self.cfg.auto_create_worktrees,
+                name,
+                source_session_id.as_deref(),
+                task.as_deref(),
+                variables.clone(),
             )
             .await
             {
-                Ok(session_id) => session_id,
+                Ok(outcome) => {
+                    created_ids.extend(outcome.created.into_iter().map(|step| step.session_id));
+                }
                 Err(error) => {
-                    let preferred_selection =
-                        post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
-                    self.refresh_after_spawn(preferred_selection.as_deref());
-                    let mut summary = if created_ids.is_empty() {
-                        format!("spawn failed: {error}")
-                    } else {
-                        format!(
-                            "spawn partially completed: {} of {} queued before failure: {error}",
-                            created_ids.len(),
-                            plan.spawn_count
-                        )
-                    };
-                    if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len())
-                    {
-                        summary.push_str(" | ");
-                        summary.push_str(&layout_note);
-                    }
-                    self.set_operator_note(summary);
+                    self.set_operator_note(format!("template launch failed: {error}"));
                     return;
                 }
-            };
-
-            if let (Some(source_id), Some(task), Some(context)) = (
-                source_session_id.as_ref(),
-                source_task.as_ref(),
-                handoff_context.as_ref(),
-            ) {
-                if let Err(error) = comms::send(
-                    &self.db,
-                    source_id,
-                    &session_id,
-                    &comms::MessageType::TaskHandoff {
-                        task: task.clone(),
-                        context: context.clone(),
-                    },
-                ) {
-                    tracing::warn!(
-                        "Failed to send handoff from session {} to {}: {error}",
-                        source_id,
-                        session_id
-                    );
-                }
-            }
-
-            created_ids.push(session_id);
+            },
         }
 
         let preferred_selection =
             post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
         self.refresh_after_spawn(preferred_selection.as_deref());
-        let mut note = build_spawn_note(&plan, created_ids.len());
+        let queued_count = created_ids
+            .iter()
+            .filter(|session_id| {
+                self.db
+                    .pending_worktree_queue_contains(session_id)
+                    .unwrap_or(false)
+            })
+            .count();
+        let mut note = build_spawn_note(&plan, created_ids.len(), queued_count);
         if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len()) {
             note.push_str(" | ");
             note.push_str(&layout_note);
@@ -2549,7 +3767,12 @@ impl Dashboard {
         self.search_matches.clear();
         self.selected_search_match = 0;
         if had_query || had_input {
-            self.set_operator_note("cleared output search".to_string());
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "output search"
+            };
+            self.set_operator_note(format!("cleared {mode}"));
         }
     }
 
@@ -2599,23 +3822,27 @@ impl Dashboard {
     pub fn cycle_output_time_filter(&mut self) {
         if !matches!(
             self.output_mode,
-            OutputMode::SessionOutput | OutputMode::Timeline
+            OutputMode::SessionOutput | OutputMode::Timeline | OutputMode::ContextGraph
         ) {
             self.set_operator_note(
-                "time filters are only available in session output or timeline view".to_string(),
+                "time filters are only available in session output, graph, or timeline view"
+                    .to_string(),
             );
             return;
         }
 
         self.output_time_filter = self.output_time_filter.next();
-        if self.output_mode == OutputMode::SessionOutput {
+        if matches!(
+            self.output_mode,
+            OutputMode::SessionOutput | OutputMode::ContextGraph
+        ) {
             self.recompute_search_matches();
         }
         self.sync_output_scroll(self.last_output_height.max(1));
-        let note_prefix = if self.output_mode == OutputMode::Timeline {
-            "timeline range"
-        } else {
-            "output time filter"
+        let note_prefix = match self.output_mode {
+            OutputMode::Timeline => "timeline range",
+            OutputMode::ContextGraph => "graph range",
+            _ => "output time filter",
         };
         self.set_operator_note(format!(
             "{note_prefix} set to {}",
@@ -2636,6 +3863,41 @@ impl Dashboard {
         self.set_operator_note(format!(
             "timeline filter set to {}",
             self.timeline_event_filter.label()
+        ));
+    }
+
+    pub fn toggle_context_graph_mode(&mut self) {
+        match self.output_mode {
+            OutputMode::ContextGraph => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
+            _ => {
+                self.output_mode = OutputMode::ContextGraph;
+                self.selected_pane = Pane::Output;
+                self.output_follow = false;
+                self.output_scroll_offset = 0;
+                self.recompute_search_matches();
+                self.set_operator_note("showing selected session context graph".to_string());
+            }
+        }
+    }
+
+    pub fn cycle_graph_entity_filter(&mut self) {
+        if self.output_mode != OutputMode::ContextGraph {
+            self.set_operator_note(
+                "graph entity filters are only available in context graph view".to_string(),
+            );
+            return;
+        }
+
+        self.graph_entity_filter = self.graph_entity_filter.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "graph filter set to {}",
+            self.graph_entity_filter.label()
         ));
     }
 
@@ -2740,38 +4002,92 @@ impl Dashboard {
             }
         }
 
+        if let Err(error) = manager::activate_pending_worktree_sessions(&self.db, &self.cfg).await {
+            tracing::warn!("Failed to activate queued worktree sessions: {error}");
+        }
+
         self.sync_from_store();
     }
 
-    fn sync_runtime_metrics(&mut self) {
+    fn sync_runtime_metrics(
+        &mut self,
+    ) -> (
+        Option<manager::HeartbeatEnforcementOutcome>,
+        Option<manager::BudgetEnforcementOutcome>,
+        Option<manager::ConflictEnforcementOutcome>,
+    ) {
         if let Err(error) = self.db.refresh_session_durations() {
             tracing::warn!("Failed to refresh session durations: {error}");
         }
 
         let metrics_path = self.cfg.cost_metrics_path();
-        let signature = cost_metrics_signature(&metrics_path);
-        if signature == self.last_cost_metrics_signature {
-            return;
-        }
-
-        self.last_cost_metrics_signature = signature;
-        if signature.is_some() {
-            if let Err(error) = self.db.sync_cost_tracker_metrics(&metrics_path) {
-                tracing::warn!("Failed to sync cost tracker metrics: {error}");
+        let signature = metrics_file_signature(&metrics_path);
+        if signature != self.last_cost_metrics_signature {
+            self.last_cost_metrics_signature = signature;
+            if signature.is_some() {
+                if let Err(error) = self.db.sync_cost_tracker_metrics(&metrics_path) {
+                    tracing::warn!("Failed to sync cost tracker metrics: {error}");
+                }
             }
         }
+
+        let activity_path = self.cfg.tool_activity_metrics_path();
+        let activity_signature = metrics_file_signature(&activity_path);
+        if activity_signature != self.last_tool_activity_signature {
+            self.last_tool_activity_signature = activity_signature;
+            if activity_signature.is_some() {
+                if let Err(error) = self.db.sync_tool_activity_metrics(&activity_path) {
+                    tracing::warn!("Failed to sync tool activity metrics: {error}");
+                }
+            }
+        }
+
+        let heartbeat_enforcement = match manager::enforce_session_heartbeats(&self.db, &self.cfg) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                tracing::warn!("Failed to enforce session heartbeats: {error}");
+                None
+            }
+        };
+
+        let budget_enforcement = match manager::enforce_budget_hard_limits(&self.db, &self.cfg) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                tracing::warn!("Failed to enforce budget hard limits: {error}");
+                None
+            }
+        };
+
+        let conflict_enforcement = match manager::enforce_conflict_resolution(&self.db, &self.cfg) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                tracing::warn!("Failed to enforce conflict resolution: {error}");
+                None
+            }
+        };
+
+        (
+            heartbeat_enforcement,
+            budget_enforcement,
+            conflict_enforcement,
+        )
     }
 
     fn sync_from_store(&mut self) {
-        self.sync_runtime_metrics();
+        let (heartbeat_enforcement, budget_enforcement, conflict_enforcement) =
+            self.sync_runtime_metrics();
         let selected_id = self.selected_session_id().map(ToOwned::to_owned);
         self.sessions = match self.db.list_sessions() {
-            Ok(sessions) => sessions,
+            Ok(mut sessions) => {
+                sort_sessions_for_display(&mut sessions);
+                sessions
+            }
             Err(error) => {
                 tracing::warn!("Failed to refresh sessions: {error}");
                 Vec::new()
             }
         };
+        self.session_harnesses = load_session_harnesses(&self.db, &self.cfg, &self.sessions);
         self.unread_message_counts = match self.db.unread_message_counts() {
             Ok(counts) => counts,
             Err(error) => {
@@ -2779,8 +4095,12 @@ impl Dashboard {
                 HashMap::new()
             }
         };
+        self.sync_approval_queue();
         self.sync_handoff_backlog_counts();
+        self.sync_board_meta();
         self.sync_worktree_health_by_session();
+        self.sync_session_state_notifications();
+        self.sync_approval_notifications();
         self.sync_global_handoff_backlog();
         self.sync_daemon_activity();
         self.sync_output_cache();
@@ -2788,9 +4108,353 @@ impl Dashboard {
         self.ensure_selected_pane_visible();
         self.sync_selected_output();
         self.sync_selected_diff();
+        self.sync_selected_git_status();
         self.sync_selected_messages();
         self.sync_selected_lineage();
         self.refresh_logs();
+        self.sync_budget_alerts();
+
+        if let Some(outcome) =
+            budget_enforcement.filter(|outcome| !outcome.paused_sessions.is_empty())
+        {
+            self.set_operator_note(budget_auto_pause_note(&outcome));
+        }
+        if let Some(outcome) = conflict_enforcement.filter(|outcome| outcome.created_incidents > 0)
+        {
+            self.set_operator_note(conflict_enforcement_note(&outcome));
+        }
+        if let Some(outcome) = heartbeat_enforcement.filter(|outcome| {
+            !outcome.stale_sessions.is_empty() || !outcome.auto_terminated_sessions.is_empty()
+        }) {
+            self.set_operator_note(heartbeat_enforcement_note(&outcome));
+        }
+    }
+
+    fn sync_budget_alerts(&mut self) {
+        let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
+        let current_state = aggregate.overall_state;
+        if current_state == self.last_budget_alert_state {
+            return;
+        }
+
+        let previous_state = self.last_budget_alert_state;
+        self.last_budget_alert_state = current_state;
+
+        if current_state <= previous_state {
+            return;
+        }
+
+        let Some(summary_suffix) = current_state.summary_suffix(thresholds) else {
+            return;
+        };
+
+        let token_budget = if self.cfg.token_budget > 0 {
+            format!(
+                "{} / {}",
+                format_token_count(aggregate.total_tokens),
+                format_token_count(self.cfg.token_budget)
+            )
+        } else {
+            format!("{} / no budget", format_token_count(aggregate.total_tokens))
+        };
+        let cost_budget = if self.cfg.cost_budget_usd > 0.0 {
+            format!(
+                "{} / {}",
+                format_currency(aggregate.total_cost_usd),
+                format_currency(self.cfg.cost_budget_usd)
+            )
+        } else {
+            format!("{} / no budget", format_currency(aggregate.total_cost_usd))
+        };
+
+        self.set_operator_note(format!(
+            "{summary_suffix} | tokens {token_budget} | cost {cost_budget}"
+        ));
+        self.notify_desktop(
+            NotificationEvent::BudgetAlert,
+            "ECC 2.0: Budget alert",
+            &format!("{summary_suffix} | tokens {token_budget} | cost {cost_budget}"),
+        );
+        self.notify_webhook(
+            NotificationEvent::BudgetAlert,
+            &budget_alert_webhook_body(
+                &summary_suffix,
+                &token_budget,
+                &cost_budget,
+                self.active_session_count(),
+            ),
+        );
+    }
+
+    fn sync_session_state_notifications(&mut self) {
+        let mut next_states = HashMap::new();
+        let mut completion_summaries = Vec::new();
+        let mut failed_notifications = Vec::new();
+        let mut started_webhooks = Vec::new();
+        let mut completion_webhooks = Vec::new();
+        let mut failed_webhooks = Vec::new();
+
+        for session in &self.sessions {
+            let previous_state = self.last_session_states.get(&session.id);
+            if let Some(previous_state) = previous_state {
+                if previous_state != &session.state {
+                    match session.state {
+                        SessionState::Running => {
+                            started_webhooks.push(session_started_webhook_body(
+                                session,
+                                session_compare_url(session).as_deref(),
+                            ));
+                        }
+                        SessionState::Completed => {
+                            let summary = self.build_completion_summary(session);
+                            self.persist_completion_summary_observation(
+                                session,
+                                &summary,
+                                "completion_summary",
+                            );
+                            if self.cfg.completion_summary_notifications.enabled {
+                                completion_summaries.push(summary.clone());
+                            } else if self.cfg.desktop_notifications.session_completed {
+                                self.notify_desktop(
+                                    NotificationEvent::SessionCompleted,
+                                    "ECC 2.0: Session completed",
+                                    &format!(
+                                        "{} | {}",
+                                        format_session_id(&session.id),
+                                        truncate_for_dashboard(&session.task, 96)
+                                    ),
+                                );
+                            }
+                            completion_webhooks.push(completion_summary_webhook_body(
+                                &summary,
+                                session,
+                                session_compare_url(session).as_deref(),
+                            ));
+                        }
+                        SessionState::Failed => {
+                            let summary = self.build_completion_summary(session);
+                            self.persist_completion_summary_observation(
+                                session,
+                                &summary,
+                                "failure_summary",
+                            );
+                            failed_notifications.push((
+                                "ECC 2.0: Session failed".to_string(),
+                                format!(
+                                    "{} | {}",
+                                    format_session_id(&session.id),
+                                    truncate_for_dashboard(&session.task, 96)
+                                ),
+                            ));
+                            failed_webhooks.push(completion_summary_webhook_body(
+                                &summary,
+                                session,
+                                session_compare_url(session).as_deref(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            } else if session.state == SessionState::Running {
+                started_webhooks.push(session_started_webhook_body(
+                    session,
+                    session_compare_url(session).as_deref(),
+                ));
+            }
+
+            next_states.insert(session.id.clone(), session.state.clone());
+        }
+
+        for summary in completion_summaries {
+            self.deliver_completion_summary(summary);
+        }
+
+        for body in started_webhooks {
+            self.notify_webhook(NotificationEvent::SessionStarted, &body);
+        }
+
+        if self.cfg.desktop_notifications.session_failed {
+            for (title, body) in failed_notifications {
+                self.notify_desktop(NotificationEvent::SessionFailed, &title, &body);
+            }
+        }
+
+        for body in completion_webhooks {
+            self.notify_webhook(NotificationEvent::SessionCompleted, &body);
+        }
+
+        for body in failed_webhooks {
+            self.notify_webhook(NotificationEvent::SessionFailed, &body);
+        }
+
+        self.last_session_states = next_states;
+    }
+
+    fn persist_completion_summary_observation(
+        &self,
+        session: &Session,
+        summary: &SessionCompletionSummary,
+        observation_type: &str,
+    ) {
+        let observation_summary = format!(
+            "{} | files {} | tests {}/{} | warnings {}",
+            truncate_for_dashboard(&summary.task, 72),
+            summary.files_changed,
+            summary.tests_passed,
+            summary.tests_run,
+            summary.warnings.len()
+        );
+        let details = completion_summary_observation_details(summary, session);
+        let priority = if observation_type == "failure_summary" {
+            ContextObservationPriority::High
+        } else {
+            ContextObservationPriority::Normal
+        };
+        if let Err(error) = self.db.add_session_observation(
+            &session.id,
+            observation_type,
+            priority,
+            false,
+            &observation_summary,
+            &details,
+        ) {
+            tracing::warn!(
+                "Failed to persist completion observation for {}: {error}",
+                session.id
+            );
+        }
+    }
+
+    fn sync_approval_notifications(&mut self) {
+        let latest_message = match self.db.latest_unread_approval_message() {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!("Failed to refresh latest approval request: {error}");
+                return;
+            }
+        };
+
+        let Some(message) = latest_message else {
+            return;
+        };
+
+        if self
+            .last_seen_approval_message_id
+            .is_some_and(|last_seen| message.id <= last_seen)
+        {
+            return;
+        }
+
+        self.last_seen_approval_message_id = Some(message.id);
+        let preview =
+            truncate_for_dashboard(&comms::preview(&message.msg_type, &message.content), 96);
+        self.notify_desktop(
+            NotificationEvent::ApprovalRequest,
+            "ECC 2.0: Approval needed",
+            &format!(
+                "{} from {} | {}",
+                format_session_id(&message.to_session),
+                format_session_id(&message.from_session),
+                preview
+            ),
+        );
+        self.notify_webhook(
+            NotificationEvent::ApprovalRequest,
+            &approval_request_webhook_body(&message, &preview),
+        );
+    }
+
+    fn deliver_completion_summary(&mut self, summary: SessionCompletionSummary) {
+        if self.cfg.completion_summary_notifications.desktop_enabled()
+            && self.cfg.desktop_notifications.session_completed
+        {
+            self.notify_desktop(
+                NotificationEvent::SessionCompleted,
+                &summary.title(),
+                &summary.notification_body(),
+            );
+        }
+
+        if self.cfg.completion_summary_notifications.popup_enabled() {
+            if self.active_completion_popup.is_none() {
+                self.active_completion_popup = Some(summary);
+            } else {
+                self.queued_completion_popups.push_back(summary);
+            }
+        }
+    }
+
+    fn build_completion_summary(&self, session: &Session) -> SessionCompletionSummary {
+        let file_activity = match self.db.list_file_activity(&session.id, 5) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load file activity for completion summary {}: {error}",
+                    session.id
+                );
+                Vec::new()
+            }
+        };
+        let tool_logs = match self.db.list_tool_logs_for_session(&session.id) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load tool logs for completion summary {}: {error}",
+                    session.id
+                );
+                Vec::new()
+            }
+        };
+        let overlaps = match self.db.list_file_overlaps(&session.id, 3) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load file overlaps for completion summary {}: {error}",
+                    session.id
+                );
+                Vec::new()
+            }
+        };
+
+        let tests = summarize_test_runs(&tool_logs, session.state == SessionState::Completed);
+        let recent_files = recent_completion_files(&file_activity, session.metrics.files_changed);
+        let key_decisions =
+            summarize_completion_decisions(&tool_logs, &file_activity, &session.task);
+        let warnings = summarize_completion_warnings(
+            session,
+            &tool_logs,
+            &tests,
+            self.worktree_health_by_session.get(&session.id),
+            self.approval_queue_counts
+                .get(&session.id)
+                .copied()
+                .unwrap_or(0),
+            overlaps.len(),
+        );
+
+        SessionCompletionSummary {
+            session_id: session.id.clone(),
+            task: session.task.clone(),
+            state: session.state.clone(),
+            files_changed: session.metrics.files_changed,
+            tokens_used: session.metrics.tokens_used,
+            duration_secs: session.metrics.duration_secs,
+            cost_usd: session.metrics.cost_usd,
+            tests_run: tests.total,
+            tests_passed: tests.passed,
+            recent_files,
+            key_decisions,
+            warnings,
+        }
+    }
+
+    fn notify_desktop(&self, event: NotificationEvent, title: &str, body: &str) {
+        let _ = self.notifier.notify(event, title, body);
+    }
+
+    fn notify_webhook(&self, event: NotificationEvent, body: &str) {
+        let _ = self.webhook_notifier.notify(event, body);
     }
 
     fn sync_selection(&mut self) {
@@ -2839,7 +4503,7 @@ impl Dashboard {
     }
 
     fn ensure_selected_pane_visible(&mut self) {
-        if !self.visible_panes().contains(&self.selected_pane) {
+        if !self.is_pane_visible(self.selected_pane) {
             self.selected_pane = Pane::Sessions;
         }
     }
@@ -2942,6 +4606,16 @@ impl Dashboard {
         }
     }
 
+    fn sync_board_meta(&mut self) {
+        self.board_meta_by_session = match self.db.list_session_board_meta() {
+            Ok(meta) => meta,
+            Err(error) => {
+                tracing::warn!("Failed to refresh board metadata: {error}");
+                HashMap::new()
+            }
+        };
+    }
+
     fn sync_worktree_health_by_session(&mut self) {
         self.worktree_health_by_session.clear();
         for session in &self.sessions {
@@ -3000,14 +4674,35 @@ impl Dashboard {
                 .ok()
                 .flatten()
         });
+        self.selected_diff_hunk_offsets_unified = self
+            .selected_diff_patch
+            .as_deref()
+            .map(build_unified_diff_hunk_offsets)
+            .unwrap_or_default();
+        self.selected_diff_hunk_offsets_split = self
+            .selected_diff_patch
+            .as_deref()
+            .map(|patch| build_worktree_diff_columns(patch, self.theme_palette()).hunk_offsets)
+            .unwrap_or_default();
+        if self.selected_diff_hunk >= self.current_diff_hunk_offsets().len() {
+            self.selected_diff_hunk = 0;
+        }
         self.selected_merge_readiness =
             worktree.and_then(|worktree| worktree::merge_readiness(worktree).ok());
-        self.selected_conflict_protocol = session
-            .zip(worktree)
-            .zip(self.selected_merge_readiness.as_ref())
-            .and_then(|((session, worktree), merge_readiness)| {
-                build_conflict_protocol(&session.id, worktree, merge_readiness)
-            });
+        self.selected_conflict_protocol = session.and_then(|selected_session| {
+            worktree
+                .zip(self.selected_merge_readiness.as_ref())
+                .and_then(|(worktree, merge_readiness)| {
+                    build_conflict_protocol(&selected_session.id, worktree, merge_readiness)
+                })
+                .or_else(|| {
+                    let incidents = self
+                        .db
+                        .list_open_conflict_incidents_for_session(&selected_session.id, 5)
+                        .unwrap_or_default();
+                    build_session_conflict_protocol(&selected_session.id, &incidents)
+                })
+        });
         if self.output_mode == OutputMode::WorktreeDiff && self.selected_diff_patch.is_none() {
             self.output_mode = OutputMode::SessionOutput;
         }
@@ -3015,6 +4710,165 @@ impl Dashboard {
             && self.selected_conflict_protocol.is_none()
         {
             self.output_mode = OutputMode::SessionOutput;
+        }
+        self.sync_selected_git_status();
+        self.sync_selected_git_patch();
+    }
+
+    fn sync_selected_git_status(&mut self) {
+        let session = self.sessions.get(self.selected_session);
+        let worktree = session.and_then(|session| session.worktree.as_ref());
+        self.selected_git_status_entries = worktree
+            .and_then(|worktree| worktree::git_status_entries(worktree).ok())
+            .unwrap_or_default();
+        if self.selected_git_status >= self.selected_git_status_entries.len() {
+            self.selected_git_status = self.selected_git_status_entries.len().saturating_sub(1);
+        }
+        if matches!(
+            self.output_mode,
+            OutputMode::GitStatus | OutputMode::GitPatch
+        ) && worktree.is_none()
+        {
+            self.output_mode = OutputMode::SessionOutput;
+        }
+    }
+
+    fn sync_selected_git_patch(&mut self) {
+        let Some((entry, worktree)) = self.selected_git_status_context() else {
+            self.selected_git_patch = None;
+            self.selected_git_patch_hunk_offsets_unified.clear();
+            self.selected_git_patch_hunk_offsets_split.clear();
+            self.selected_git_patch_hunk = 0;
+            if self.output_mode == OutputMode::GitPatch {
+                self.output_mode = OutputMode::GitStatus;
+            }
+            return;
+        };
+
+        self.selected_git_patch = worktree::git_status_patch_view(&worktree, &entry)
+            .ok()
+            .flatten();
+        self.selected_git_patch_hunk_offsets_unified = self
+            .selected_git_patch
+            .as_ref()
+            .map(|patch| build_unified_diff_hunk_offsets(&patch.patch))
+            .unwrap_or_default();
+        self.selected_git_patch_hunk_offsets_split = self
+            .selected_git_patch
+            .as_ref()
+            .map(|patch| {
+                build_worktree_diff_columns(&patch.patch, self.theme_palette()).hunk_offsets
+            })
+            .unwrap_or_default();
+        if self.selected_git_patch_hunk >= self.current_diff_hunk_offsets().len() {
+            self.selected_git_patch_hunk = 0;
+        }
+        if self.output_mode == OutputMode::GitPatch && self.selected_git_patch.is_none() {
+            self.output_mode = OutputMode::GitStatus;
+        }
+    }
+
+    fn selected_git_status_context(
+        &self,
+    ) -> Option<(worktree::GitStatusEntry, crate::session::WorktreeInfo)> {
+        let session = self.sessions.get(self.selected_session)?;
+        let worktree = session.worktree.clone()?;
+        let entry = self
+            .selected_git_status_entries
+            .get(self.selected_git_status)
+            .cloned()?;
+        Some((entry, worktree))
+    }
+
+    fn selected_git_patch_context(
+        &self,
+    ) -> Option<(
+        worktree::GitStatusEntry,
+        crate::session::WorktreeInfo,
+        worktree::GitStatusPatchView,
+        worktree::GitPatchHunk,
+    )> {
+        let (entry, worktree) = self.selected_git_status_context()?;
+        let patch = self.selected_git_patch.clone()?;
+        let hunk = patch.hunks.get(self.selected_git_patch_hunk).cloned()?;
+        Some((entry, worktree, patch, hunk))
+    }
+
+    fn refresh_after_git_status_action(&mut self, preferred_path: Option<&str>) {
+        let keep_patch_view = self.output_mode == OutputMode::GitPatch;
+        let preferred_hunk = self.selected_git_patch_hunk;
+        self.refresh();
+        self.selected_pane = Pane::Output;
+        self.output_follow = false;
+        if let Some(path) = preferred_path {
+            if let Some(index) = self
+                .selected_git_status_entries
+                .iter()
+                .position(|entry| entry.path == path)
+            {
+                self.selected_git_status = index;
+            }
+        }
+        self.sync_selected_git_patch();
+        if keep_patch_view && self.selected_git_patch.is_some() {
+            self.output_mode = OutputMode::GitPatch;
+            let max_index = self.current_diff_hunk_offsets().len().saturating_sub(1);
+            self.selected_git_patch_hunk = preferred_hunk.min(max_index);
+            self.output_scroll_offset = self.current_diff_hunk_offset();
+        } else {
+            self.output_mode = OutputMode::GitStatus;
+        }
+        self.sync_output_scroll(self.last_output_height.max(1));
+    }
+
+    fn active_patch_text(&self) -> Option<&String> {
+        match self.output_mode {
+            OutputMode::GitPatch => self.selected_git_patch.as_ref().map(|patch| &patch.patch),
+            OutputMode::WorktreeDiff => self.selected_diff_patch.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn current_diff_hunk_offsets(&self) -> &[usize] {
+        match self.output_mode {
+            OutputMode::GitPatch => match self.diff_view_mode {
+                DiffViewMode::Split => &self.selected_git_patch_hunk_offsets_split,
+                DiffViewMode::Unified => &self.selected_git_patch_hunk_offsets_unified,
+            },
+            _ => match self.diff_view_mode {
+                DiffViewMode::Split => &self.selected_diff_hunk_offsets_split,
+                DiffViewMode::Unified => &self.selected_diff_hunk_offsets_unified,
+            },
+        }
+    }
+
+    fn current_diff_hunk_index(&self) -> usize {
+        match self.output_mode {
+            OutputMode::GitPatch => self.selected_git_patch_hunk,
+            _ => self.selected_diff_hunk,
+        }
+    }
+
+    fn set_current_diff_hunk_index(&mut self, index: usize) {
+        match self.output_mode {
+            OutputMode::GitPatch => self.selected_git_patch_hunk = index,
+            _ => self.selected_diff_hunk = index,
+        }
+    }
+
+    fn current_diff_hunk_offset(&self) -> usize {
+        self.current_diff_hunk_offsets()
+            .get(self.current_diff_hunk_index())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn diff_hunk_title_suffix(&self) -> String {
+        let total = self.current_diff_hunk_offsets().len();
+        if total == 0 {
+            String::new()
+        } else {
+            format!(" {}/{}", self.current_diff_hunk_index() + 1, total)
         }
     }
 
@@ -3106,6 +4960,7 @@ impl Dashboard {
                                 SessionState::Pending => team.pending += 1,
                                 SessionState::Failed => team.failed += 1,
                                 SessionState::Stopped => team.stopped += 1,
+                                SessionState::Stale => team.stale += 1,
                                 SessionState::Completed => {}
                             }
 
@@ -3169,8 +5024,16 @@ impl Dashboard {
                 }
 
                 self.selected_team_summary = if team.total > 0 { Some(team) } else { None };
-                self.selected_route_preview =
-                    self.build_route_preview(team.total, &route_candidates);
+                let selected_agent_type = self
+                    .selected_agent_type()
+                    .unwrap_or(self.cfg.default_agent.as_str())
+                    .to_string();
+                self.selected_route_preview = self.build_route_preview(
+                    &session_id,
+                    &selected_agent_type,
+                    team.total,
+                    &route_candidates,
+                );
                 delegated.sort_by_key(|delegate| {
                     (
                         delegate_attention_priority(delegate),
@@ -3193,9 +5056,23 @@ impl Dashboard {
 
     fn build_route_preview(
         &self,
+        lead_id: &str,
+        lead_agent_type: &str,
         delegate_count: usize,
         delegates: &[DelegatedChildSummary],
     ) -> Option<String> {
+        if let Some(task) = self.latest_route_task(lead_id) {
+            if let Ok(preview) = manager::preview_assignment_for_task(
+                &self.db,
+                &self.cfg,
+                lead_id,
+                &task,
+                lead_agent_type,
+            ) {
+                return Some(self.format_assignment_preview(&task, &preview));
+            }
+        }
+
         if let Some(idle_clear) = delegates
             .iter()
             .filter(|delegate| {
@@ -3219,7 +5096,7 @@ impl Dashboard {
             .min_by_key(|delegate| (delegate.handoff_backlog, delegate.session_id.as_str()))
         {
             return Some(format!(
-                "reuse idle {} with backlog {}",
+                "defer; idle {} backlog {}",
                 format_session_id(&idle_backed_up.session_id),
                 idle_backed_up.handoff_backlog
             ));
@@ -3236,9 +5113,18 @@ impl Dashboard {
             .min_by_key(|delegate| (delegate.handoff_backlog, delegate.session_id.as_str()))
         {
             return Some(format!(
-                "reuse active {} with backlog {}",
+                "{} active {}{}",
+                if active_delegate.handoff_backlog > 0 {
+                    "defer;"
+                } else {
+                    "reuse"
+                },
                 format_session_id(&active_delegate.session_id),
-                active_delegate.handoff_backlog
+                if active_delegate.handoff_backlog > 0 {
+                    format!(" backlog {}", active_delegate.handoff_backlog)
+                } else {
+                    String::new()
+                }
             ));
         }
 
@@ -3246,6 +5132,77 @@ impl Dashboard {
             Some("spawn new delegate".to_string())
         } else {
             Some("spawn fallback delegate".to_string())
+        }
+    }
+
+    fn latest_route_task(&self, session_id: &str) -> Option<String> {
+        self.db
+            .list_messages_for_session(session_id, 16)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|message| {
+                if message.to_session != session_id || message.msg_type != "task_handoff" {
+                    return None;
+                }
+                manager::parse_task_handoff_task(&message.content).or_else(|| Some(message.content))
+            })
+    }
+
+    fn format_assignment_preview(
+        &self,
+        task: &str,
+        preview: &manager::AssignmentPreview,
+    ) -> String {
+        let task_preview = truncate_for_dashboard(task, 40);
+        let graph_suffix = if preview.graph_match_terms.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " | graph {}",
+                truncate_for_dashboard(&preview.graph_match_terms.join(", "), 36)
+            )
+        };
+
+        match preview.action {
+            manager::AssignmentAction::Spawned => {
+                format!("for `{task_preview}` spawn new delegate")
+            }
+            manager::AssignmentAction::ReusedIdle => format!(
+                "for `{task_preview}` reuse idle {}{}",
+                preview
+                    .session_id
+                    .as_deref()
+                    .map(format_session_id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                graph_suffix
+            ),
+            manager::AssignmentAction::ReusedActive => format!(
+                "for `{task_preview}` reuse active {}{}",
+                preview
+                    .session_id
+                    .as_deref()
+                    .map(format_session_id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                graph_suffix
+            ),
+            manager::AssignmentAction::DeferredSaturated => {
+                let state_label = match preview.delegate_state {
+                    Some(SessionState::Idle) => "idle",
+                    Some(SessionState::Running) | Some(SessionState::Pending) => "active",
+                    _ => "delegate",
+                };
+                format!(
+                    "for `{task_preview}` defer; {state_label} {} backlog {}{}",
+                    preview
+                        .session_id
+                        .as_deref()
+                        .map(format_session_id)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    preview.handoff_backlog,
+                    graph_suffix
+                )
+            }
         }
     }
 
@@ -3304,25 +5261,286 @@ impl Dashboard {
             .unwrap_or_default()
     }
 
+    fn visible_graph_lines(&self) -> Vec<GraphDisplayLine> {
+        let session_scope = match self.search_scope {
+            SearchScope::SelectedSession => self.selected_session_id(),
+            SearchScope::AllSessions => None,
+        };
+        let entity_type = self.graph_entity_filter.entity_type();
+        let entities = self
+            .db
+            .list_context_entities(session_scope, entity_type, 48)
+            .unwrap_or_default();
+        let show_session_label = self.search_scope == SearchScope::AllSessions;
+
+        entities
+            .into_iter()
+            .filter(|entity| self.output_time_filter.matches_timestamp(entity.updated_at))
+            .flat_map(|entity| self.graph_lines_for_entity(entity, show_session_label))
+            .collect()
+    }
+
+    fn graph_lines_for_entity(
+        &self,
+        entity: crate::session::ContextGraphEntity,
+        show_session_label: bool,
+    ) -> Vec<GraphDisplayLine> {
+        let session_id = entity.session_id.clone().unwrap_or_default();
+        let session_label = if show_session_label {
+            if session_id.is_empty() {
+                "global ".to_string()
+            } else {
+                format!("{} ", format_session_id(&session_id))
+            }
+        } else {
+            String::new()
+        };
+        let entity_title = format!(
+            "[{}] {}{:<8} {}",
+            entity.updated_at.format("%H:%M:%S"),
+            session_label,
+            entity.entity_type,
+            entity.name
+        );
+        let mut lines = vec![GraphDisplayLine {
+            session_id: session_id.clone(),
+            text: entity_title,
+        }];
+
+        if let Some(path) = entity.path.as_ref() {
+            lines.push(GraphDisplayLine {
+                session_id: session_id.clone(),
+                text: format!("               path {}", truncate_for_dashboard(path, 96)),
+            });
+        }
+
+        if !entity.summary.trim().is_empty() {
+            lines.push(GraphDisplayLine {
+                session_id: session_id.clone(),
+                text: format!(
+                    "               summary {}",
+                    truncate_for_dashboard(&entity.summary, 96)
+                ),
+            });
+        }
+
+        if let Ok(Some(detail)) = self.db.get_context_entity_detail(entity.id, 2) {
+            for relation in detail.outgoing {
+                lines.push(GraphDisplayLine {
+                    session_id: session_id.clone(),
+                    text: format!(
+                        "               -> {} {}:{}",
+                        relation.relation_type,
+                        relation.to_entity_type,
+                        truncate_for_dashboard(&relation.to_entity_name, 72)
+                    ),
+                });
+            }
+            for relation in detail.incoming {
+                lines.push(GraphDisplayLine {
+                    session_id: session_id.clone(),
+                    text: format!(
+                        "               <- {} {}:{}",
+                        relation.relation_type,
+                        relation.from_entity_type,
+                        truncate_for_dashboard(&relation.from_entity_name, 72)
+                    ),
+                });
+            }
+        }
+
+        lines
+    }
+
+    fn session_graph_metrics_lines(&self, session_id: &str) -> Vec<String> {
+        let entity = self
+            .db
+            .list_context_entities(Some(session_id), Some("session"), 4)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|entity| {
+                entity.session_id.as_deref() == Some(session_id) || entity.name == session_id
+            });
+        let Some(entity) = entity else {
+            return Vec::new();
+        };
+
+        let Ok(Some(detail)) = self
+            .db
+            .get_context_entity_detail(entity.id, MAX_METRICS_GRAPH_RELATIONS)
+        else {
+            return Vec::new();
+        };
+
+        if detail.outgoing.is_empty() && detail.incoming.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = vec![
+            "Context graph".to_string(),
+            format!(
+                "- outgoing {} | incoming {}",
+                detail.outgoing.len(),
+                detail.incoming.len()
+            ),
+        ];
+
+        for relation in detail.outgoing.iter().take(4) {
+            lines.push(format!(
+                "- -> {} {}:{}",
+                relation.relation_type,
+                relation.to_entity_type,
+                truncate_for_dashboard(&relation.to_entity_name, 72)
+            ));
+        }
+
+        for relation in detail.incoming.iter().take(2) {
+            lines.push(format!(
+                "- <- {} {}:{}",
+                relation.relation_type,
+                relation.from_entity_type,
+                truncate_for_dashboard(&relation.from_entity_name, 72)
+            ));
+        }
+
+        lines
+    }
+
+    fn session_graph_recall_lines(&self, session: &Session) -> Vec<String> {
+        let query = session.task.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(entries) = self.db.recall_context_entities(None, query, 4) else {
+            return Vec::new();
+        };
+
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.entity.entity_type == "session" && entry.entity.name == session.id)
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = vec!["Relevant memory".to_string()];
+        for entry in entries {
+            let mut line = format!(
+                "- #{} [{}] {} | score {} | relations {} | observations {} | priority {}",
+                entry.entity.id,
+                entry.entity.entity_type,
+                truncate_for_dashboard(&entry.entity.name, 60),
+                entry.score,
+                entry.relation_count,
+                entry.observation_count,
+                entry.max_observation_priority
+            );
+            if entry.has_pinned_observation {
+                line.push_str(" | pinned");
+            }
+            if let Some(session_id) = entry.entity.session_id.as_deref() {
+                if session_id != session.id {
+                    line.push_str(&format!(" | {}", format_session_id(session_id)));
+                }
+            }
+            lines.push(line);
+            if !entry.matched_terms.is_empty() {
+                lines.push(format!("  matches {}", entry.matched_terms.join(", ")));
+            }
+            if let Some(path) = entry.entity.path.as_deref() {
+                lines.push(format!("  path {}", truncate_for_dashboard(path, 72)));
+            }
+            if !entry.entity.summary.is_empty() {
+                lines.push(format!(
+                    "  summary {}",
+                    truncate_for_dashboard(&entry.entity.summary, 72)
+                ));
+            }
+            if let Ok(observations) = self.db.list_context_observations(Some(entry.entity.id), 1) {
+                if let Some(observation) = observations.first() {
+                    lines.push(format!(
+                        "  memory [{}{}] {}",
+                        observation.priority,
+                        if observation.pinned { "/pinned" } else { "" },
+                        truncate_for_dashboard(&observation.summary, 72)
+                    ));
+                }
+            }
+        }
+
+        lines
+    }
+
+    fn visible_git_status_lines(&self) -> Vec<Line<'static>> {
+        self.selected_git_status_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let marker = if index == self.selected_git_status {
+                    ">>"
+                } else {
+                    "-"
+                };
+                let mut flags = Vec::new();
+                if entry.conflicted {
+                    flags.push("conflict");
+                }
+                if entry.staged {
+                    flags.push("staged");
+                }
+                if entry.unstaged {
+                    flags.push("unstaged");
+                }
+                if entry.untracked {
+                    flags.push("untracked");
+                }
+                let flag_text = if flags.is_empty() {
+                    "clean".to_string()
+                } else {
+                    flags.join(",")
+                };
+                Line::from(format!(
+                    "{} [{}{}] [{}] {}",
+                    marker,
+                    entry.index_status,
+                    entry.worktree_status,
+                    flag_text,
+                    entry.display_path
+                ))
+            })
+            .collect()
+    }
+
     fn visible_timeline_lines(&self) -> Vec<Line<'static>> {
         let show_session_label = self.timeline_scope == SearchScope::AllSessions;
         self.timeline_events()
             .into_iter()
             .filter(|event| self.timeline_event_filter.matches(event.event_type))
             .filter(|event| self.output_time_filter.matches_timestamp(event.occurred_at))
-            .map(|event| {
+            .flat_map(|event| {
                 let prefix = if show_session_label {
                     format!("{} ", format_session_id(&event.session_id))
                 } else {
                     String::new()
                 };
-                Line::from(format!(
+                let mut lines = vec![Line::from(format!(
                     "[{}] {}{:<11} {}",
                     event.occurred_at.format("%H:%M:%S"),
                     prefix,
                     event.event_type.label(),
                     event.summary
-                ))
+                ))];
+                lines.extend(
+                    event
+                        .detail_lines
+                        .into_iter()
+                        .map(|line| Line::from(format!("               {}", line))),
+                );
+                lines
             })
             .collect()
     }
@@ -3359,6 +5577,7 @@ impl Dashboard {
                 session.agent_type,
                 truncate_for_dashboard(&session.task, 64)
             ),
+            detail_lines: Vec::new(),
         }];
 
         if session.updated_at > session.created_at {
@@ -3367,6 +5586,7 @@ impl Dashboard {
                 session_id: session.id.clone(),
                 event_type: TimelineEventType::Lifecycle,
                 summary: format!("state {} | updated session metadata", session.state),
+                detail_lines: Vec::new(),
             });
         }
 
@@ -3379,16 +5599,30 @@ impl Dashboard {
                     "attached worktree {} from {}",
                     worktree.branch, worktree.base_branch
                 ),
+                detail_lines: Vec::new(),
             });
         }
 
-        if session.metrics.files_changed > 0 {
+        let file_activity = self
+            .db
+            .list_file_activity(&session.id, 64)
+            .unwrap_or_default();
+        if file_activity.is_empty() && session.metrics.files_changed > 0 {
             events.push(TimelineEvent {
                 occurred_at: session.updated_at,
                 session_id: session.id.clone(),
                 event_type: TimelineEventType::FileChange,
-                summary: format!("files changed {}", session.metrics.files_changed),
+                summary: format!("files touched {}", session.metrics.files_changed),
+                detail_lines: Vec::new(),
             });
+        } else {
+            events.extend(file_activity.into_iter().map(|entry| TimelineEvent {
+                occurred_at: entry.timestamp,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::FileChange,
+                summary: file_activity_summary(&entry),
+                detail_lines: file_activity_patch_lines(&entry, MAX_FILE_ACTIVITY_PATCH_LINES),
+            }));
         }
 
         let messages = self
@@ -3414,7 +5648,20 @@ impl Dashboard {
                         64
                     )
                 ),
+                detail_lines: Vec::new(),
             }
+        }));
+
+        let decisions = self
+            .db
+            .list_decisions_for_session(&session.id, 32)
+            .unwrap_or_default();
+        events.extend(decisions.into_iter().map(|entry| TimelineEvent {
+            occurred_at: entry.timestamp,
+            session_id: session.id.clone(),
+            event_type: TimelineEventType::Decision,
+            summary: decision_log_summary(&entry),
+            detail_lines: decision_log_detail_lines(&entry),
         }));
 
         let tool_logs = self
@@ -3433,6 +5680,7 @@ impl Dashboard {
                     entry.duration_ms,
                     truncate_for_dashboard(&entry.input_summary, 56)
                 ),
+                detail_lines: tool_log_detail_lines(&entry),
             })
         }));
         events
@@ -3451,22 +5699,34 @@ impl Dashboard {
             return;
         };
 
-        self.search_matches = self
-            .search_target_session_ids()
-            .into_iter()
-            .flat_map(|session_id| {
-                self.visible_output_lines_for_session(session_id)
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, line)| {
-                        regex.is_match(&line.text).then_some(SearchMatch {
-                            session_id: session_id.to_string(),
-                            line_index: index,
-                        })
+        self.search_matches = if self.output_mode == OutputMode::ContextGraph {
+            self.visible_graph_lines()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    regex.is_match(&line.text).then_some(SearchMatch {
+                        session_id: line.session_id,
+                        line_index: index,
                     })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            self.search_target_session_ids()
+                .into_iter()
+                .flat_map(|session_id| {
+                    self.visible_output_lines_for_session(session_id)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, line)| {
+                            regex.is_match(&line.text).then_some(SearchMatch {
+                                session_id: session_id.to_string(),
+                                line_index: index,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
 
         if self.search_matches.is_empty() {
             self.selected_search_match = 0;
@@ -3485,7 +5745,9 @@ impl Dashboard {
             return;
         };
 
-        if self.selected_session_id() != Some(search_match.session_id.as_str()) {
+        if !search_match.session_id.is_empty()
+            && self.selected_session_id() != Some(search_match.session_id.as_str())
+        {
             self.sync_selection_by_id(Some(&search_match.session_id));
             self.sync_selected_output();
             self.sync_selected_diff();
@@ -3511,8 +5773,13 @@ impl Dashboard {
             self.selected_search_match.min(total.saturating_sub(1)) + 1
         };
 
+        let mode = if self.output_mode == OutputMode::ContextGraph {
+            "graph search"
+        } else {
+            "search"
+        };
         format!(
-            "search /{query} match {current}/{total} | {}",
+            "{mode} /{query} match {current}/{total} | {}",
             self.search_scope.label()
         )
     }
@@ -3520,6 +5787,7 @@ impl Dashboard {
     fn search_match_session_count(&self) -> usize {
         self.search_matches
             .iter()
+            .filter(|search_match| !search_match.session_id.is_empty())
             .map(|search_match| search_match.session_id.as_str())
             .collect::<HashSet<_>>()
             .len()
@@ -3582,6 +5850,14 @@ impl Dashboard {
 
     fn sync_output_scroll(&mut self, viewport_height: usize) {
         self.last_output_height = viewport_height.max(1);
+        if self.output_mode == OutputMode::GitStatus {
+            let max_scroll = self.max_output_scroll();
+            let centered = self
+                .selected_git_status
+                .saturating_sub(self.last_output_height.max(1).saturating_sub(1) / 2);
+            self.output_scroll_offset = centered.min(max_scroll);
+            return;
+        }
         let max_scroll = self.max_output_scroll();
 
         if self.output_follow {
@@ -3592,9 +5868,23 @@ impl Dashboard {
     }
 
     fn max_output_scroll(&self) -> usize {
-        self.visible_output_lines()
-            .len()
-            .saturating_sub(self.last_output_height.max(1))
+        let total_lines = if self.output_mode == OutputMode::GitStatus {
+            self.selected_git_status_entries.len()
+        } else if matches!(
+            self.output_mode,
+            OutputMode::WorktreeDiff | OutputMode::GitPatch
+        ) {
+            self.active_patch_text()
+                .map(|patch| patch.lines().count())
+                .unwrap_or(0)
+        } else if self.output_mode == OutputMode::ContextGraph {
+            self.visible_graph_lines().len()
+        } else if self.output_mode == OutputMode::Timeline {
+            self.visible_timeline_lines().len()
+        } else {
+            self.visible_output_lines().len()
+        };
+        total_lines.saturating_sub(self.last_output_height.max(1))
     }
 
     fn sync_metrics_scroll(&mut self, viewport_height: usize) {
@@ -3774,6 +6064,7 @@ impl Dashboard {
     }
 
     fn aggregate_usage(&self) -> AggregateUsage {
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         let total_tokens = self
             .sessions
             .iter()
@@ -3784,8 +6075,12 @@ impl Dashboard {
             .iter()
             .map(|session| session.metrics.cost_usd)
             .sum::<f64>();
-        let token_state = budget_state(total_tokens as f64, self.cfg.token_budget as f64);
-        let cost_state = budget_state(total_cost_usd, self.cfg.cost_budget_usd);
+        let token_state = budget_state(
+            total_tokens as f64,
+            self.cfg.token_budget as f64,
+            thresholds,
+        );
+        let cost_state = budget_state(total_cost_usd, self.cfg.cost_budget_usd, thresholds);
 
         AggregateUsage {
             total_tokens,
@@ -3799,6 +6094,15 @@ impl Dashboard {
     fn selected_session_metrics_text(&self) -> String {
         if let Some(session) = self.sessions.get(self.selected_session) {
             let metrics = &session.metrics;
+            let selected_profile = self.db.get_session_profile(&session.id).ok().flatten();
+            let group_peers = self
+                .sessions
+                .iter()
+                .filter(|candidate| {
+                    candidate.project == session.project
+                        && candidate.task_group == session.task_group
+                })
+                .count();
             let mut lines = vec![
                 format!(
                     "Selected {} [{}]",
@@ -3806,7 +6110,60 @@ impl Dashboard {
                     session.state
                 ),
                 format!("Task {}", session.task),
+                format!(
+                    "Project {} | Group {} | Peer sessions {}",
+                    session.project, session.task_group, group_peers
+                ),
             ];
+
+            if let Some(profile) = selected_profile.as_ref() {
+                let model = profile.model.as_deref().unwrap_or("default");
+                let permission_mode = profile.permission_mode.as_deref().unwrap_or("default");
+                lines.push(format!(
+                    "Profile {} | Model {} | Permissions {}",
+                    profile.profile_name, model, permission_mode
+                ));
+                let mut profile_details = Vec::new();
+                if let Some(token_budget) = profile.token_budget {
+                    profile_details.push(format!(
+                        "Profile tokens {}",
+                        format_token_count(token_budget)
+                    ));
+                }
+                if let Some(max_budget_usd) = profile.max_budget_usd {
+                    profile_details
+                        .push(format!("Profile cost {}", format_currency(max_budget_usd)));
+                }
+                if !profile.allowed_tools.is_empty() {
+                    profile_details.push(format!(
+                        "Allow {}",
+                        truncate_for_dashboard(&profile.allowed_tools.join(", "), 36)
+                    ));
+                }
+                if !profile.disallowed_tools.is_empty() {
+                    profile_details.push(format!(
+                        "Deny {}",
+                        truncate_for_dashboard(&profile.disallowed_tools.join(", "), 36)
+                    ));
+                }
+                if !profile.add_dirs.is_empty() {
+                    profile_details.push(format!(
+                        "Dirs {}",
+                        truncate_for_dashboard(
+                            &profile
+                                .add_dirs
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            36
+                        )
+                    ));
+                }
+                if !profile_details.is_empty() {
+                    lines.push(profile_details.join(" | "));
+                }
+            }
 
             if let Some(parent) = self.selected_parent_session.as_ref() {
                 lines.push(format!("Delegated from {}", format_session_id(parent)));
@@ -4008,6 +6365,43 @@ impl Dashboard {
                         lines.push(format!("- conflict {conflict}"));
                     }
                 }
+                if let Ok(merge_queue) = manager::build_merge_queue(&self.db) {
+                    let entry = merge_queue
+                        .ready_entries
+                        .iter()
+                        .chain(merge_queue.blocked_entries.iter())
+                        .find(|entry| entry.session_id == session.id);
+                    if let Some(entry) = entry {
+                        lines.push("Merge queue".to_string());
+                        if let Some(position) = entry.queue_position {
+                            lines.push(format!(
+                                "- ready #{} | {}",
+                                position, entry.suggested_action
+                            ));
+                        } else {
+                            lines.push(format!("- blocked | {}", entry.suggested_action));
+                        }
+                        for blocker in entry.blocked_by.iter().take(2) {
+                            lines.push(format!(
+                                "  blocker {} [{}] | {}",
+                                format_session_id(&blocker.session_id),
+                                blocker.branch,
+                                blocker.summary
+                            ));
+                            for conflict in blocker.conflicts.iter().take(3) {
+                                lines.push(format!("    conflict {conflict}"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(harness) = self.session_harnesses.get(&session.id) {
+                lines.push(format!(
+                    "Harness {} | Detected {}",
+                    harness.primary_label,
+                    harness.detected_summary()
+                ));
             }
 
             lines.push(format!(
@@ -4020,6 +6414,74 @@ impl Dashboard {
                 "Tools {} | Files {}",
                 metrics.tool_calls, metrics.files_changed,
             ));
+            let recent_file_activity = self
+                .db
+                .list_file_activity(&session.id, 5)
+                .unwrap_or_default();
+            if !recent_file_activity.is_empty() {
+                lines.push("Recent file activity".to_string());
+                for entry in recent_file_activity {
+                    lines.push(format!(
+                        "- {} {}",
+                        self.short_timestamp(&entry.timestamp.to_rfc3339()),
+                        file_activity_summary(&entry)
+                    ));
+                    for detail in file_activity_patch_lines(&entry, 2) {
+                        lines.push(format!("  {}", detail));
+                    }
+                }
+            }
+            let recent_decisions = self
+                .db
+                .list_decisions_for_session(&session.id, 5)
+                .unwrap_or_default();
+            if !recent_decisions.is_empty() {
+                lines.push("Recent decisions".to_string());
+                for entry in recent_decisions {
+                    lines.push(format!(
+                        "- {} {}",
+                        self.short_timestamp(&entry.timestamp.to_rfc3339()),
+                        decision_log_summary(&entry)
+                    ));
+                    for detail in decision_log_detail_lines(&entry).into_iter().take(3) {
+                        lines.push(format!("  {}", detail));
+                    }
+                }
+            }
+            lines.extend(self.session_graph_recall_lines(session));
+            lines.extend(self.session_graph_metrics_lines(&session.id));
+            let file_overlaps = self
+                .db
+                .list_file_overlaps(&session.id, 3)
+                .unwrap_or_default();
+            if !file_overlaps.is_empty() {
+                lines.push("Potential overlaps".to_string());
+                for overlap in file_overlaps {
+                    lines.push(format!(
+                        "- {}",
+                        file_overlap_summary(
+                            &overlap,
+                            &self.short_timestamp(&overlap.timestamp.to_rfc3339())
+                        )
+                    ));
+                }
+            }
+            let conflict_incidents = self
+                .db
+                .list_open_conflict_incidents_for_session(&session.id, 3)
+                .unwrap_or_default();
+            if !conflict_incidents.is_empty() {
+                lines.push("Active conflicts".to_string());
+                for incident in conflict_incidents {
+                    lines.push(format!(
+                        "- {}",
+                        conflict_incident_summary(
+                            &incident,
+                            &self.short_timestamp(&incident.updated_at.to_rfc3339())
+                        )
+                    ));
+                }
+            }
             lines.push(format!(
                 "Cost ${:.4} | Duration {}s",
                 metrics.cost_usd, metrics.duration_secs
@@ -4070,8 +6532,271 @@ impl Dashboard {
         }
     }
 
+    fn board_text(&self) -> String {
+        if self.sessions.is_empty() {
+            return "No sessions available.\n\nStart a session to populate the board.".to_string();
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!("Board snapshot | {} sessions", self.sessions.len()));
+
+        if let Some(session) = self.sessions.get(self.selected_session) {
+            let meta = self.board_meta_by_session.get(&session.id);
+            let branch = session_branch(session);
+            lines.push(format!(
+                "Focus {} {} | {} | {}{}",
+                board_presence_marker(session),
+                board_codename(session),
+                meta.map(|meta| meta.lane.as_str())
+                    .unwrap_or_else(|| board_lane_label(&session.state)),
+                format_session_id(&session.id),
+                if branch == "-" {
+                    String::new()
+                } else {
+                    format!(" | {branch}")
+                }
+            ));
+            lines.push(format!("Task {}", truncate_for_dashboard(&session.task, 48)));
+            if let Some(meta) = meta {
+                lines.push(format!(
+                    "Progress {:>3}% {}",
+                    meta.progress_percent,
+                    board_progress_bar(meta.progress_percent)
+                ));
+                if let Some(status_detail) = meta.status_detail.as_ref() {
+                    lines.push(format!("Status {status_detail}"));
+                }
+                if let Some(movement_note) = meta.movement_note.as_ref() {
+                    lines.push(format!("Event {movement_note}"));
+                }
+                if meta.handoff_backlog > 0 {
+                    lines.push(format!("Inbox {} handoff(s)", meta.handoff_backlog));
+                }
+                if let Some(activity_note) = meta.activity_note.as_ref() {
+                    lines.push(format!("Route {activity_note}"));
+                }
+                lines.push(format!(
+                    "Coords C{} R{} S{}",
+                    meta.column_index + 1,
+                    meta.row_index + 1,
+                    meta.stack_index + 1
+                ));
+                if let Some(row_label) = meta.row_label.as_ref() {
+                    lines.push(format!("Row {row_label}"));
+                }
+                if let Some(project) = meta.project.as_ref() {
+                    lines.push(format!("Project {project}"));
+                }
+                if let Some(feature) = meta.feature.as_ref() {
+                    lines.push(format!("Feature {feature}"));
+                }
+                if let Some(issue) = meta.issue.as_ref() {
+                    lines.push(format!("Issue {issue}"));
+                }
+            }
+        }
+
+        let overlap_risks = self.board_overlap_risks();
+        if overlap_risks.is_empty() {
+            lines.push("Overlap risk clear".to_string());
+        } else {
+            lines.push("Overlap risk".to_string());
+            for risk in overlap_risks {
+                lines.push(format!("- {risk}"));
+            }
+        }
+
+        let lanes = ["Inbox", "In Progress", "Review", "Blocked", "Done", "Stopped"];
+        for label in lanes {
+            let mut lane_sessions = self
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    let lane = self
+                        .board_meta_by_session
+                        .get(&session.id)
+                        .map(|meta| meta.lane.as_str())
+                        .unwrap_or_else(|| board_lane_label(&session.state));
+                    if lane == label {
+                        Some((session, self.board_meta_by_session.get(&session.id)))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if lane_sessions.is_empty() {
+                continue;
+            }
+
+            let mut row_risks: HashMap<(i64, String), Vec<String>> = HashMap::new();
+            let mut row_backlogs: HashMap<(i64, String), i64> = HashMap::new();
+            for (_, meta) in &lane_sessions {
+                let Some(meta) = meta else {
+                    continue;
+                };
+                let key = (
+                    meta.row_index,
+                    meta.row_label
+                        .clone()
+                        .unwrap_or_else(|| "General".to_string()),
+                );
+                if let Some(conflict_signal) = meta.conflict_signal.as_ref() {
+                    let entry = row_risks.entry(key.clone()).or_default();
+                    for risk in conflict_signal.split("; ") {
+                        if !entry.iter().any(|existing| existing == risk) {
+                            entry.push(risk.to_string());
+                        }
+                    }
+                }
+                if meta.handoff_backlog > 0 {
+                    *row_backlogs.entry(key).or_default() += meta.handoff_backlog;
+                }
+            }
+
+            lane_sessions.sort_by(|left, right| {
+                let left_meta = left.1.cloned().unwrap_or_default();
+                let right_meta = right.1.cloned().unwrap_or_default();
+                left_meta
+                    .row_index
+                    .cmp(&right_meta.row_index)
+                    .then_with(|| left_meta.stack_index.cmp(&right_meta.stack_index))
+                    .then_with(|| left.0.id.cmp(&right.0.id))
+            });
+
+            lines.push(String::new());
+            lines.push(format!("{label} ({})", lane_sessions.len()));
+            let mut current_row: Option<String> = None;
+            for (session, meta) in lane_sessions.into_iter().take(6) {
+                let meta = meta.cloned().unwrap_or_default();
+                let row_label = meta
+                    .row_label
+                    .clone()
+                    .unwrap_or_else(|| "General".to_string());
+                if current_row.as_ref() != Some(&row_label) {
+                    current_row = Some(row_label.clone());
+                    let row_key = (meta.row_index, row_label.clone());
+                    let row_conflict_summary = row_risks
+                        .get(&row_key)
+                        .filter(|risks| !risks.is_empty())
+                        .map(|risks| truncate_for_dashboard(&risks.join(" + "), 42));
+                    let row_backlog = row_backlogs.get(&row_key).copied().unwrap_or(0);
+                    let row_pressure_summary = if row_backlog > 0 {
+                        Some(format!("{} handoff(s)", row_backlog))
+                    } else {
+                        None
+                    };
+                    let row_marker = if row_conflict_summary.is_some() {
+                        "!"
+                    } else if row_pressure_summary.is_some() {
+                        "+"
+                    } else {
+                        "-"
+                    };
+                    lines.push(format!(
+                        "  {} Row {} | {}{}{}",
+                        row_marker,
+                        meta.row_index + 1,
+                        row_label,
+                        row_conflict_summary
+                            .map(|summary| format!(" | {summary}"))
+                            .unwrap_or_default(),
+                        row_pressure_summary
+                            .map(|summary| format!(" | {summary}"))
+                            .unwrap_or_default()
+                    ));
+                }
+                let branch = session_branch(session);
+                let branch_suffix = if branch == "-" {
+                    String::new()
+                } else {
+                    format!(" | {branch}")
+                };
+                let activity_suffix = meta
+                    .activity_note
+                    .as_ref()
+                    .map(|note| format!(" | {}", truncate_for_dashboard(note, 26)))
+                    .unwrap_or_default();
+                let backlog_suffix = if meta.handoff_backlog > 0 {
+                    format!(" | inbox {}", meta.handoff_backlog)
+                } else {
+                    String::new()
+                };
+                let kind_marker = board_activity_marker(&meta);
+                lines.push(format!(
+                    "    {}{} {} {} {} [{}] {:>3}% {} | {}{}{}{}",
+                    board_motion_marker(&meta),
+                    kind_marker,
+                    board_presence_marker(session),
+                    board_codename(session),
+                    format_session_id(&session.id),
+                    session.agent_type,
+                    meta.progress_percent,
+                    board_progress_bar(meta.progress_percent),
+                    truncate_for_dashboard(meta.status_detail.as_deref().unwrap_or(&session.task), 18),
+                    activity_suffix,
+                    backlog_suffix,
+                    branch_suffix
+                ));
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    fn board_overlap_risks(&self) -> Vec<String> {
+        let mut risks = self
+            .board_meta_by_session
+            .values()
+            .filter_map(|meta| meta.conflict_signal.clone())
+            .collect::<Vec<_>>();
+        if risks.is_empty() {
+            let mut duplicate_branches: HashMap<String, Vec<String>> = HashMap::new();
+            let mut duplicate_tasks: HashMap<String, Vec<String>> = HashMap::new();
+
+            for session in self.sessions.iter().filter(|session| {
+                matches!(
+                    session.state,
+                    SessionState::Pending
+                        | SessionState::Running
+                        | SessionState::Idle
+                        | SessionState::Stale
+                )
+            }) {
+                if let Some(worktree) = session.worktree.as_ref() {
+                    duplicate_branches
+                        .entry(worktree.branch.clone())
+                        .or_default()
+                        .push(format_session_id(&session.id));
+                }
+                duplicate_tasks
+                    .entry(session.task.trim().to_ascii_lowercase())
+                    .or_default()
+                    .push(format_session_id(&session.id));
+            }
+
+            for (branch, sessions) in duplicate_branches {
+                if sessions.len() >= 2 {
+                    risks.push(format!("Shared branch {branch}: {}", sessions.join(", ")));
+                }
+            }
+            for (task, sessions) in duplicate_tasks {
+                if sessions.len() >= 2 {
+                    risks.push(format!(
+                        "Shared task {}: {}",
+                        truncate_for_dashboard(&task, 32),
+                        sessions.join(", ")
+                    ));
+                }
+            }
+        }
+        risks.sort();
+        risks.dedup();
+        risks
+    }
+
     fn aggregate_cost_summary(&self) -> (String, Style) {
         let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         let mut text = if self.cfg.cost_budget_usd > 0.0 {
             format!(
                 "Aggregate cost {} / {}",
@@ -4085,54 +6810,12 @@ impl Dashboard {
             )
         };
 
-        if let Some(summary_suffix) = aggregate.overall_state.summary_suffix() {
+        if let Some(summary_suffix) = aggregate.overall_state.summary_suffix(thresholds) {
             text.push_str(" | ");
-            text.push_str(summary_suffix);
+            text.push_str(&summary_suffix);
         }
 
         (text, aggregate.overall_state.style())
-    }
-
-    fn sync_budget_alerts(&mut self) {
-        let aggregate = self.aggregate_usage();
-        let current_state = aggregate.overall_state;
-        if current_state == self.last_budget_alert_state {
-            return;
-        }
-
-        let previous_state = self.last_budget_alert_state;
-        self.last_budget_alert_state = current_state;
-
-        if current_state <= previous_state {
-            return;
-        }
-
-        let Some(summary_suffix) = current_state.summary_suffix() else {
-            return;
-        };
-
-        let token_budget = if self.cfg.token_budget > 0 {
-            format!(
-                "{} / {}",
-                format_token_count(aggregate.total_tokens),
-                format_token_count(self.cfg.token_budget)
-            )
-        } else {
-            format!("{} / no budget", format_token_count(aggregate.total_tokens))
-        };
-        let cost_budget = if self.cfg.cost_budget_usd > 0.0 {
-            format!(
-                "{} / {}",
-                format_currency(aggregate.total_cost_usd),
-                format_currency(self.cfg.cost_budget_usd)
-            )
-        } else {
-            format!("{} / no budget", format_currency(aggregate.total_cost_usd))
-        };
-
-        self.set_operator_note(format!(
-            "{summary_suffix} | tokens {token_budget} | cost {cost_budget}"
-        ));
     }
 
     fn attention_queue_items(&self, limit: usize) -> Vec<String> {
@@ -4198,7 +6881,10 @@ impl Dashboard {
             .filter(|session| {
                 matches!(
                     session.state,
-                    SessionState::Pending | SessionState::Running | SessionState::Idle
+                    SessionState::Pending
+                        | SessionState::Running
+                        | SessionState::Idle
+                        | SessionState::Stale
                 )
             })
             .count()
@@ -4240,18 +6926,58 @@ impl Dashboard {
             .max_parallel_sessions
             .saturating_sub(self.active_session_count());
 
-        if available_slots == 0 {
-            return Err(format!(
-                "cannot queue sessions: active session limit reached ({})",
-                self.cfg.max_parallel_sessions
-            ));
-        }
+        match request {
+            SpawnRequest::AdHoc {
+                requested_count,
+                task,
+            } => {
+                if available_slots == 0 {
+                    return Err(format!(
+                        "cannot queue sessions: active session limit reached ({})",
+                        self.cfg.max_parallel_sessions
+                    ));
+                }
 
-        Ok(SpawnPlan {
-            requested_count: request.requested_count,
-            spawn_count: request.requested_count.min(available_slots),
-            task: request.task,
-        })
+                Ok(SpawnPlan::AdHoc {
+                    requested_count,
+                    spawn_count: requested_count.min(available_slots),
+                    task,
+                })
+            }
+            SpawnRequest::Template {
+                name,
+                task,
+                variables,
+            } => {
+                let repo_root = std::env::current_dir().map_err(|error| {
+                    format!("failed to resolve cwd for template preview: {error}")
+                })?;
+                let source_session = self.sessions.get(self.selected_session);
+                let preview_vars = manager::build_template_variables(
+                    &repo_root,
+                    source_session,
+                    task.as_deref(),
+                    variables.clone(),
+                );
+                let template = self
+                    .cfg
+                    .resolve_orchestration_template(&name, &preview_vars)
+                    .map_err(|error| error.to_string())?;
+                if available_slots < template.steps.len() {
+                    return Err(format!(
+                        "template {name} requires {} session slots but only {available_slots} available",
+                        template.steps.len()
+                    ));
+                }
+
+                Ok(SpawnPlan::Template {
+                    name,
+                    task,
+                    variables,
+                    step_count: template.steps.len(),
+                })
+            }
+        }
     }
 
     fn pane_areas(&self, area: Rect) -> PaneAreas {
@@ -4345,7 +7071,9 @@ impl Dashboard {
     }
 
     fn visible_detail_panes(&self) -> Vec<Pane> {
-        self.visible_panes()
+        self.layout_panes()
+            .into_iter()
+            .filter(|pane| !self.collapsed_panes.contains(pane))
             .into_iter()
             .filter(|pane| *pane != Pane::Sessions)
             .collect()
@@ -4387,6 +7115,19 @@ impl Dashboard {
         match self.cfg.theme {
             Theme::Dark => "dark",
             Theme::Light => "light",
+        }
+    }
+
+    fn board_pane_visible(&self) -> bool {
+        self.cfg.pane_layout == PaneLayout::Grid
+            && !self.collapsed_panes.contains(&Pane::Metrics)
+            && self.layout_panes().contains(&Pane::Metrics)
+    }
+
+    fn is_pane_visible(&self, pane: Pane) -> bool {
+        match pane {
+            Pane::Board => self.board_pane_visible(),
+            _ => self.visible_panes().contains(&pane),
         }
     }
 
@@ -4457,6 +7198,7 @@ impl Pane {
             Pane::Sessions => "Sessions",
             Pane::Output => "Output",
             Pane::Metrics => "Metrics",
+            Pane::Board => "Board",
             Pane::Log => "Log",
         }
     }
@@ -4467,6 +7209,7 @@ impl Pane {
             2 => Some(Self::Output),
             3 => Some(Self::Metrics),
             4 => Some(Self::Log),
+            5 => Some(Self::Board),
             _ => None,
         }
     }
@@ -4476,7 +7219,8 @@ impl Pane {
             Self::Sessions => 1,
             Self::Output => 2,
             Self::Metrics => 3,
-            Self::Log => 4,
+            Self::Board => 4,
+            Self::Log => 5,
         }
     }
 }
@@ -4486,6 +7230,7 @@ fn pane_rect(pane_areas: &PaneAreas, pane: Pane) -> Option<Rect> {
         Pane::Sessions => Some(pane_areas.sessions),
         Pane::Output => pane_areas.output,
         Pane::Metrics => pane_areas.metrics,
+        Pane::Board => pane_areas.metrics,
         Pane::Log => pane_areas.log,
     }
 }
@@ -4571,6 +7316,10 @@ fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
         return Err("spawn request cannot be empty".to_string());
     }
 
+    if let Some(template_request) = parse_template_spawn_request(trimmed)? {
+        return Ok(template_request);
+    }
+
     let count = Regex::new(r"\b([1-9]\d*)\b")
         .expect("spawn count regex")
         .captures(trimmed)
@@ -4583,10 +7332,64 @@ fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
         return Err("spawn request must include a task description".to_string());
     }
 
-    Ok(SpawnRequest {
+    Ok(SpawnRequest::AdHoc {
         requested_count: count,
         task,
     })
+}
+
+fn parse_template_spawn_request(input: &str) -> Result<Option<SpawnRequest>, String> {
+    let captures = Regex::new(
+        r"(?is)^\s*template\s+(?P<name>[A-Za-z0-9_-]+)(?:\s+for\s+(?P<task>.*?))?(?:\s+with\s+(?P<vars>.+))?\s*$",
+    )
+    .expect("template spawn regex")
+    .captures(input);
+
+    let Some(captures) = captures else {
+        return Ok(None);
+    };
+
+    let name = captures
+        .name("name")
+        .map(|value| value.as_str().trim().to_string())
+        .ok_or_else(|| "template request must include a template name".to_string())?;
+    let task = captures
+        .name("task")
+        .map(|value| value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty());
+    let variables = captures
+        .name("vars")
+        .map(|value| parse_template_request_variables(value.as_str()))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(Some(SpawnRequest::Template {
+        name,
+        task,
+        variables,
+    }))
+}
+
+fn parse_template_request_variables(input: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut variables = BTreeMap::new();
+    for entry in input
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("template vars must use key=value form: {entry}"))?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(format!(
+                "template vars must use non-empty key=value form: {entry}"
+            ));
+        }
+        variables.insert(key.to_string(), value.to_string());
+    }
+    Ok(variables)
 }
 
 fn extract_spawn_task(input: &str) -> String {
@@ -4625,16 +7428,41 @@ fn expand_spawn_tasks(task: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn build_spawn_note(plan: &SpawnPlan, created_count: usize) -> String {
-    let task = truncate_for_dashboard(&plan.task, 72);
-    if plan.spawn_count < plan.requested_count {
-        format!(
-            "spawned {created_count} session(s) for {task} (requested {}, capped at {})",
-            plan.requested_count, plan.spawn_count
-        )
-    } else {
-        format!("spawned {created_count} session(s) for {task}")
+fn build_spawn_note(plan: &SpawnPlan, created_count: usize, queued_count: usize) -> String {
+    let mut note = match plan {
+        SpawnPlan::AdHoc {
+            requested_count,
+            spawn_count,
+            task,
+        } => {
+            let task = truncate_for_dashboard(task, 72);
+            if spawn_count < requested_count {
+                format!(
+                    "spawned {created_count} session(s) for {task} (requested {requested_count}, capped at {spawn_count})"
+                )
+            } else {
+                format!("spawned {created_count} session(s) for {task}")
+            }
+        }
+        SpawnPlan::Template {
+            name,
+            task,
+            step_count,
+            ..
+        } => {
+            let scope = task
+                .as_ref()
+                .map(|task| format!(" for {}", truncate_for_dashboard(task, 72)))
+                .unwrap_or_default();
+            format!("launched template {name} ({created_count}/{step_count} step(s)){scope}")
+        }
+    };
+
+    if queued_count > 0 {
+        note.push_str(&format!(" | {queued_count} pending worktree slot"));
     }
+
+    note
 }
 
 fn post_spawn_selection_id(
@@ -4761,6 +7589,22 @@ impl OutputTimeFilter {
     }
 }
 
+impl DiffViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Unified => "unified",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::Split => " split",
+            Self::Unified => " unified",
+        }
+    }
+}
+
 impl TimelineEventFilter {
     fn next(self) -> Self {
         match self {
@@ -4768,7 +7612,8 @@ impl TimelineEventFilter {
             Self::Lifecycle => Self::Messages,
             Self::Messages => Self::ToolCalls,
             Self::ToolCalls => Self::FileChanges,
-            Self::FileChanges => Self::All,
+            Self::FileChanges => Self::Decisions,
+            Self::Decisions => Self::All,
         }
     }
 
@@ -4779,6 +7624,7 @@ impl TimelineEventFilter {
             Self::Messages => event_type == TimelineEventType::Message,
             Self::ToolCalls => event_type == TimelineEventType::ToolCall,
             Self::FileChanges => event_type == TimelineEventType::FileChange,
+            Self::Decisions => event_type == TimelineEventType::Decision,
         }
     }
 
@@ -4789,6 +7635,7 @@ impl TimelineEventFilter {
             Self::Messages => "messages",
             Self::ToolCalls => "tool calls",
             Self::FileChanges => "file changes",
+            Self::Decisions => "decisions",
         }
     }
 
@@ -4799,6 +7646,49 @@ impl TimelineEventFilter {
             Self::Messages => " messages",
             Self::ToolCalls => " tool calls",
             Self::FileChanges => " file changes",
+            Self::Decisions => " decisions",
+        }
+    }
+}
+
+impl GraphEntityFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Decisions,
+            Self::Decisions => Self::Files,
+            Self::Files => Self::Functions,
+            Self::Functions => Self::Sessions,
+            Self::Sessions => Self::All,
+        }
+    }
+
+    fn entity_type(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Decisions => Some("decision"),
+            Self::Files => Some("file"),
+            Self::Functions => Some("function"),
+            Self::Sessions => Some("session"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all entities",
+            Self::Decisions => "decisions",
+            Self::Files => "files",
+            Self::Functions => "functions",
+            Self::Sessions => "sessions",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Decisions => " decisions",
+            Self::Files => " files",
+            Self::Functions => " functions",
+            Self::Sessions => " sessions",
         }
     }
 }
@@ -4810,6 +7700,7 @@ impl TimelineEventType {
             Self::Message => "message",
             Self::ToolCall => "tool",
             Self::FileChange => "file-change",
+            Self::Decision => "decision",
         }
     }
 }
@@ -4880,9 +7771,21 @@ impl SessionSummary {
         worktree_health_by_session: &HashMap<String, worktree::WorktreeHealth>,
         suppress_inbox_attention: bool,
     ) -> Self {
+        let projects = sessions
+            .iter()
+            .map(|session| session.project.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let task_groups = sessions
+            .iter()
+            .map(|session| (session.project.as_str(), session.task_group.as_str()))
+            .collect::<HashSet<_>>()
+            .len();
         sessions.iter().fold(
             Self {
                 total: sessions.len(),
+                projects,
+                task_groups,
                 unread_messages: if suppress_inbox_attention {
                     0
                 } else {
@@ -4903,6 +7806,7 @@ impl SessionSummary {
                     SessionState::Pending => summary.pending += 1,
                     SessionState::Running => summary.running += 1,
                     SessionState::Idle => summary.idle += 1,
+                    SessionState::Stale => summary.stale += 1,
                     SessionState::Completed => summary.completed += 1,
                     SessionState::Failed => summary.failed += 1,
                     SessionState::Stopped => summary.stopped += 1,
@@ -4924,15 +7828,21 @@ impl SessionSummary {
 
 fn session_row(
     session: &Session,
+    project_label: Option<String>,
+    task_group_label: Option<String>,
     approval_requests: usize,
     unread_messages: usize,
 ) -> Row<'static> {
+    let state_label = session_state_label(&session.state);
+    let state_color = session_state_color(&session.state);
     Row::new(vec![
         Cell::from(format_session_id(&session.id)),
+        Cell::from(project_label.unwrap_or_default()),
+        Cell::from(task_group_label.unwrap_or_default()),
         Cell::from(session.agent_type.clone()),
-        Cell::from(session_state_label(&session.state)).style(
+        Cell::from(state_label).style(
             Style::default()
-                .fg(session_state_color(&session.state))
+                .fg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Cell::from(session_branch(session)),
@@ -4967,14 +7877,27 @@ fn session_row(
     ])
 }
 
+fn sort_sessions_for_display(sessions: &mut [Session]) {
+    sessions.sort_by(|left, right| {
+        left.project
+            .cmp(&right.project)
+            .then_with(|| left.task_group.cmp(&right.task_group))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 fn summary_line(summary: &SessionSummary) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("Total {}  ", summary.total),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+        summary_span("Projects", summary.projects, Color::Cyan),
+        summary_span("Groups", summary.task_groups, Color::Magenta),
         summary_span("Running", summary.running, Color::Green),
         summary_span("Idle", summary.idle, Color::Yellow),
+        summary_span("Stale", summary.stale, Color::LightRed),
         summary_span("Completed", summary.completed, Color::Blue),
         summary_span("Failed", summary.failed, Color::Red),
         summary_span("Stopped", summary.stopped, Color::DarkGray),
@@ -5011,6 +7934,7 @@ fn attention_queue_line(summary: &SessionSummary, stabilized: bool) -> Line<'sta
     if summary.failed == 0
         && summary.stopped == 0
         && summary.pending == 0
+        && summary.stale == 0
         && summary.unread_messages == 0
         && summary.conflicted_worktrees == 0
     {
@@ -5045,6 +7969,7 @@ fn attention_queue_line(summary: &SessionSummary, stabilized: bool) -> Line<'sta
     }
 
     spans.extend([
+        summary_span("Stale", summary.stale, Color::LightRed),
         summary_span("Backlog", summary.unread_messages, Color::Magenta),
         summary_span("Failed", summary.failed, Color::Red),
         summary_span("Stopped", summary.stopped, Color::DarkGray),
@@ -5219,59 +8144,433 @@ fn highlight_output_line(
     }
 }
 
-fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
+fn build_worktree_diff_columns(patch: &str, palette: ThemePalette) -> WorktreeDiffColumns {
     let mut removals = Vec::new();
     let mut additions = Vec::new();
+    let mut hunk_offsets = Vec::new();
+    let mut pending_removals = Vec::new();
+    let mut pending_additions = Vec::new();
 
     for line in patch.lines() {
+        if is_diff_removal_line(line) {
+            pending_removals.push(line[1..].to_string());
+            continue;
+        }
+
+        if is_diff_addition_line(line) {
+            pending_additions.push(line[1..].to_string());
+            continue;
+        }
+
+        flush_split_diff_change_block(
+            &mut removals,
+            &mut additions,
+            &mut pending_removals,
+            &mut pending_additions,
+            palette,
+        );
+
         if line.is_empty() {
             continue;
         }
 
-        if line.starts_with("--- ") && !line.starts_with("--- a/") {
-            removals.push(line.to_string());
-            additions.push(line.to_string());
-            continue;
+        if line.starts_with("@@") {
+            hunk_offsets.push(removals.len().max(additions.len()));
         }
 
-        if let Some(path) = line.strip_prefix("--- a/") {
-            removals.push(format!("File {path}"));
-            continue;
-        }
-
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            additions.push(format!("File {path}"));
-            continue;
-        }
-
-        if line.starts_with("diff --git ") || line.starts_with("@@") {
-            removals.push(line.to_string());
-            additions.push(line.to_string());
-            continue;
-        }
-
-        if line.starts_with('-') {
-            removals.push(line.to_string());
-            continue;
-        }
-
-        if line.starts_with('+') {
-            additions.push(line.to_string());
-            continue;
-        }
+        let styled_line = if line.starts_with(' ') {
+            styled_diff_context_line(line, palette)
+        } else {
+            styled_diff_meta_line(split_diff_display_line(line), palette)
+        };
+        removals.push(styled_line.clone());
+        additions.push(styled_line);
     }
+
+    flush_split_diff_change_block(
+        &mut removals,
+        &mut additions,
+        &mut pending_removals,
+        &mut pending_additions,
+        palette,
+    );
 
     WorktreeDiffColumns {
         removals: if removals.is_empty() {
-            "No removals in this bounded preview.".to_string()
+            Text::from("No removals in this bounded preview.")
         } else {
-            removals.join("\n")
+            Text::from(removals)
         },
         additions: if additions.is_empty() {
-            "No additions in this bounded preview.".to_string()
+            Text::from("No additions in this bounded preview.")
         } else {
-            additions.join("\n")
+            Text::from(additions)
         },
+        hunk_offsets,
+    }
+}
+
+fn build_unified_diff_text(patch: &str, palette: ThemePalette) -> Text<'static> {
+    let mut lines = Vec::new();
+    let mut pending_removals = Vec::new();
+    let mut pending_additions = Vec::new();
+
+    for line in patch.lines() {
+        if is_diff_removal_line(line) {
+            pending_removals.push(line[1..].to_string());
+            continue;
+        }
+
+        if is_diff_addition_line(line) {
+            pending_additions.push(line[1..].to_string());
+            continue;
+        }
+
+        flush_unified_diff_change_block(
+            &mut lines,
+            &mut pending_removals,
+            &mut pending_additions,
+            palette,
+        );
+
+        if line.is_empty() {
+            continue;
+        }
+
+        lines.push(if line.starts_with(' ') {
+            styled_diff_context_line(line, palette)
+        } else {
+            styled_diff_meta_line(line, palette)
+        });
+    }
+
+    flush_unified_diff_change_block(
+        &mut lines,
+        &mut pending_removals,
+        &mut pending_additions,
+        palette,
+    );
+
+    Text::from(lines)
+}
+
+fn build_unified_diff_hunk_offsets(patch: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut rendered_index = 0usize;
+    let mut pending_removals = 0usize;
+    let mut pending_additions = 0usize;
+
+    for line in patch.lines() {
+        if is_diff_removal_line(line) {
+            pending_removals += 1;
+            continue;
+        }
+
+        if is_diff_addition_line(line) {
+            pending_additions += 1;
+            continue;
+        }
+
+        if pending_removals > 0 || pending_additions > 0 {
+            rendered_index += pending_removals + pending_additions;
+            pending_removals = 0;
+            pending_additions = 0;
+        }
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            offsets.push(rendered_index);
+        }
+        rendered_index += 1;
+    }
+
+    offsets
+}
+
+fn flush_split_diff_change_block(
+    removals: &mut Vec<Line<'static>>,
+    additions: &mut Vec<Line<'static>>,
+    pending_removals: &mut Vec<String>,
+    pending_additions: &mut Vec<String>,
+    palette: ThemePalette,
+) {
+    let pair_count = pending_removals.len().max(pending_additions.len());
+    for index in 0..pair_count {
+        match (pending_removals.get(index), pending_additions.get(index)) {
+            (Some(removal), Some(addition)) => {
+                let (removal_mask, addition_mask) =
+                    diff_word_change_masks(removal.as_str(), addition.as_str());
+                removals.push(styled_diff_change_line(
+                    '-',
+                    removal,
+                    &removal_mask,
+                    diff_removal_style(palette),
+                    diff_removal_word_style(),
+                ));
+                additions.push(styled_diff_change_line(
+                    '+',
+                    addition,
+                    &addition_mask,
+                    diff_addition_style(palette),
+                    diff_addition_word_style(),
+                ));
+            }
+            (Some(removal), None) => {
+                removals.push(styled_diff_change_line(
+                    '-',
+                    removal,
+                    &vec![false; tokenize_diff_words(removal).len()],
+                    diff_removal_style(palette),
+                    diff_removal_word_style(),
+                ));
+                additions.push(Line::from(""));
+            }
+            (None, Some(addition)) => {
+                removals.push(Line::from(""));
+                additions.push(styled_diff_change_line(
+                    '+',
+                    addition,
+                    &vec![false; tokenize_diff_words(addition).len()],
+                    diff_addition_style(palette),
+                    diff_addition_word_style(),
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+
+    pending_removals.clear();
+    pending_additions.clear();
+}
+
+fn flush_unified_diff_change_block(
+    lines: &mut Vec<Line<'static>>,
+    pending_removals: &mut Vec<String>,
+    pending_additions: &mut Vec<String>,
+    palette: ThemePalette,
+) {
+    let pair_count = pending_removals.len().max(pending_additions.len());
+    for index in 0..pair_count {
+        match (pending_removals.get(index), pending_additions.get(index)) {
+            (Some(removal), Some(addition)) => {
+                let (removal_mask, addition_mask) =
+                    diff_word_change_masks(removal.as_str(), addition.as_str());
+                lines.push(styled_diff_change_line(
+                    '-',
+                    removal,
+                    &removal_mask,
+                    diff_removal_style(palette),
+                    diff_removal_word_style(),
+                ));
+                lines.push(styled_diff_change_line(
+                    '+',
+                    addition,
+                    &addition_mask,
+                    diff_addition_style(palette),
+                    diff_addition_word_style(),
+                ));
+            }
+            (Some(removal), None) => lines.push(styled_diff_change_line(
+                '-',
+                removal,
+                &vec![false; tokenize_diff_words(removal).len()],
+                diff_removal_style(palette),
+                diff_removal_word_style(),
+            )),
+            (None, Some(addition)) => lines.push(styled_diff_change_line(
+                '+',
+                addition,
+                &vec![false; tokenize_diff_words(addition).len()],
+                diff_addition_style(palette),
+                diff_addition_word_style(),
+            )),
+            (None, None) => {}
+        }
+    }
+
+    pending_removals.clear();
+    pending_additions.clear();
+}
+
+fn split_diff_display_line(line: &str) -> String {
+    if line.starts_with("--- ") && !line.starts_with("--- a/") {
+        return line.to_string();
+    }
+
+    if let Some(path) = line.strip_prefix("--- a/") {
+        return format!("File {path}");
+    }
+
+    if let Some(path) = line.strip_prefix("+++ b/") {
+        return format!("File {path}");
+    }
+
+    line.to_string()
+}
+
+fn is_diff_removal_line(line: &str) -> bool {
+    line.starts_with('-') && !line.starts_with("--- ")
+}
+
+fn is_diff_addition_line(line: &str) -> bool {
+    line.starts_with('+') && !line.starts_with("+++ ")
+}
+
+fn styled_diff_meta_line(text: impl Into<String>, palette: ThemePalette) -> Line<'static> {
+    Line::from(vec![Span::styled(text.into(), diff_meta_style(palette))])
+}
+
+fn styled_diff_context_line(text: &str, palette: ThemePalette) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        text.to_string(),
+        diff_context_style(palette),
+    )])
+}
+
+fn styled_diff_change_line(
+    prefix: char,
+    body: &str,
+    change_mask: &[bool],
+    base_style: Style,
+    changed_style: Style,
+) -> Line<'static> {
+    let tokens = tokenize_diff_words(body);
+    let mut spans = vec![Span::styled(
+        prefix.to_string(),
+        base_style.add_modifier(Modifier::BOLD),
+    )];
+
+    for (index, token) in tokens.into_iter().enumerate() {
+        let style = if change_mask.get(index).copied().unwrap_or(false) {
+            changed_style
+        } else {
+            base_style
+        };
+        spans.push(Span::styled(token, style));
+    }
+
+    Line::from(spans)
+}
+
+fn tokenize_diff_words(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_is_whitespace: Option<bool> = None;
+
+    for ch in text.chars() {
+        let is_whitespace = ch.is_whitespace();
+        match current_is_whitespace {
+            Some(state) if state == is_whitespace => current.push(ch),
+            Some(_) => {
+                tokens.push(std::mem::take(&mut current));
+                current.push(ch);
+                current_is_whitespace = Some(is_whitespace);
+            }
+            None => {
+                current.push(ch);
+                current_is_whitespace = Some(is_whitespace);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn diff_word_change_masks(left: &str, right: &str) -> (Vec<bool>, Vec<bool>) {
+    let left_tokens = tokenize_diff_words(left);
+    let right_tokens = tokenize_diff_words(right);
+    let left_len = left_tokens.len();
+    let right_len = right_tokens.len();
+    let mut lcs = vec![vec![0usize; right_len + 1]; left_len + 1];
+
+    for left_index in (0..left_len).rev() {
+        for right_index in (0..right_len).rev() {
+            lcs[left_index][right_index] = if left_tokens[left_index] == right_tokens[right_index] {
+                lcs[left_index + 1][right_index + 1] + 1
+            } else {
+                lcs[left_index + 1][right_index].max(lcs[left_index][right_index + 1])
+            };
+        }
+    }
+
+    let mut left_changed = vec![true; left_len];
+    let mut right_changed = vec![true; right_len];
+    let (mut left_index, mut right_index) = (0usize, 0usize);
+    while left_index < left_len && right_index < right_len {
+        if left_tokens[left_index] == right_tokens[right_index] {
+            left_changed[left_index] = false;
+            right_changed[right_index] = false;
+            left_index += 1;
+            right_index += 1;
+        } else if lcs[left_index + 1][right_index] >= lcs[left_index][right_index + 1] {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+
+    (left_changed, right_changed)
+}
+
+fn diff_meta_style(palette: ThemePalette) -> Style {
+    Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_context_style(palette: ThemePalette) -> Style {
+    Style::default().fg(palette.muted)
+}
+
+fn diff_removal_style(palette: ThemePalette) -> Style {
+    let color = match palette.accent {
+        Color::Blue => Color::Red,
+        _ => Color::LightRed,
+    };
+    Style::default().fg(color)
+}
+
+fn diff_addition_style(palette: ThemePalette) -> Style {
+    let color = match palette.accent {
+        Color::Blue => Color::Green,
+        _ => Color::LightGreen,
+    };
+    Style::default().fg(color)
+}
+
+fn diff_removal_word_style() -> Style {
+    Style::default()
+        .bg(Color::Red)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_addition_word_style() -> Style {
+    Style::default()
+        .bg(Color::Green)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn board_lane_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Pending => "Inbox",
+        SessionState::Running => "In Progress",
+        SessionState::Idle => "Review",
+        SessionState::Stale | SessionState::Failed => "Blocked",
+        SessionState::Completed => "Done",
+        SessionState::Stopped => "Stopped",
     }
 }
 
@@ -5280,6 +8579,7 @@ fn session_state_label(state: &SessionState) -> &'static str {
         SessionState::Pending => "Pending",
         SessionState::Running => "Running",
         SessionState::Idle => "Idle",
+        SessionState::Stale => "Stale",
         SessionState::Completed => "Completed",
         SessionState::Failed => "Failed",
         SessionState::Stopped => "Stopped",
@@ -5290,11 +8590,590 @@ fn session_state_color(state: &SessionState) -> Color {
     match state {
         SessionState::Running => Color::Green,
         SessionState::Idle => Color::Yellow,
+        SessionState::Stale => Color::LightRed,
         SessionState::Failed => Color::Red,
         SessionState::Stopped => Color::DarkGray,
         SessionState::Completed => Color::Blue,
         SessionState::Pending => Color::Reset,
     }
+}
+
+fn board_codename(session: &Session) -> String {
+    const ADJECTIVES: &[&str] = &[
+        "Amber", "Cinder", "Moss", "Nova", "Sable", "Slate", "Swift", "Talon",
+    ];
+    const NOUNS: &[&str] = &[
+        "Fox", "Kite", "Lynx", "Otter", "Rook", "Sprite", "Wisp", "Wolf",
+    ];
+
+    let seed = session
+        .id
+        .bytes()
+        .fold(0usize, |acc, byte| acc.wrapping_mul(33).wrapping_add(byte as usize));
+    format!(
+        "{} {}",
+        ADJECTIVES[seed % ADJECTIVES.len()],
+        NOUNS[(seed / ADJECTIVES.len()) % NOUNS.len()]
+    )
+}
+
+fn file_activity_summary(entry: &FileActivityEntry) -> String {
+    let mut summary = format!(
+        "{} {}",
+        file_activity_verb(entry.action.clone()),
+        truncate_for_dashboard(&entry.path, 72)
+    );
+
+    if let Some(diff_preview) = entry.diff_preview.as_ref() {
+        summary.push_str(" | ");
+        summary.push_str(&truncate_for_dashboard(diff_preview, 56));
+    }
+
+    summary
+}
+
+fn file_activity_patch_lines(entry: &FileActivityEntry, max_lines: usize) -> Vec<String> {
+    entry
+        .patch_preview
+        .as_deref()
+        .map(|patch| {
+            patch
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && *line != "@@" && *line != "+" && *line != "-")
+                .take(max_lines)
+                .map(|line| truncate_for_dashboard(line, 72))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_overlap_summary(entry: &FileActivityOverlap, timestamp: &str) -> String {
+    format!(
+        "{} {} | {} {} as {} | {}",
+        file_activity_verb(entry.current_action.clone()),
+        truncate_for_dashboard(&entry.path, 48),
+        entry.other_session_state,
+        format_session_id(&entry.other_session_id),
+        file_activity_verb(entry.other_action.clone()),
+        timestamp
+    )
+}
+
+fn conflict_incident_summary(
+    incident: &crate::session::store::ConflictIncident,
+    timestamp: &str,
+) -> String {
+    format!(
+        "{} {} | active {} | paused {} | {}",
+        timestamp,
+        truncate_for_dashboard(&incident.path, 48),
+        format_session_id(&incident.active_session_id),
+        format_session_id(&incident.paused_session_id),
+        incident.strategy.replace('_', "-")
+    )
+}
+
+fn decision_log_summary(entry: &DecisionLogEntry) -> String {
+    format!("decided {}", truncate_for_dashboard(&entry.decision, 72))
+}
+
+fn decision_log_detail_lines(entry: &DecisionLogEntry) -> Vec<String> {
+    let mut lines = vec![format!(
+        "why {}",
+        truncate_for_dashboard(&entry.reasoning, 72)
+    )];
+    if entry.alternatives.is_empty() {
+        lines.push("alternatives none recorded".to_string());
+    } else {
+        for alternative in entry.alternatives.iter().take(3) {
+            lines.push(format!(
+                "alternative {}",
+                truncate_for_dashboard(alternative, 72)
+            ));
+        }
+    }
+    lines
+}
+
+fn tool_log_detail_lines(entry: &ToolLogEntry) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !entry.trigger_summary.trim().is_empty() {
+        lines.push(format!(
+            "why {}",
+            truncate_for_dashboard(&entry.trigger_summary, 72)
+        ));
+    }
+    if entry.input_params_json.trim() != "{}" {
+        lines.push(format!(
+            "params {}",
+            truncate_for_dashboard(&entry.input_params_json, 72)
+        ));
+    }
+    lines
+}
+
+fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn summarize_test_runs(
+    tool_logs: &[ToolLogEntry],
+    assume_success_on_completion: bool,
+) -> TestRunSummary {
+    let mut summary = TestRunSummary::default();
+
+    for entry in tool_logs {
+        if !tool_log_looks_like_test(entry) {
+            continue;
+        }
+
+        summary.total += 1;
+        let failed = tool_log_looks_failed(entry);
+        let passed = tool_log_looks_passed(entry);
+        if !failed && (passed || assume_success_on_completion) {
+            summary.passed += 1;
+        }
+    }
+
+    summary
+}
+
+fn tool_log_looks_like_test(entry: &ToolLogEntry) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        entry.tool_name,
+        entry.input_summary,
+        extract_tool_command(entry),
+        entry.output_summary
+    )
+    .to_ascii_lowercase();
+    const TEST_MARKERS: &[&str] = &[
+        "cargo test",
+        "npm test",
+        "pnpm test",
+        "pnpm exec vitest",
+        "pnpm exec playwright",
+        "yarn test",
+        "bun test",
+        "vitest",
+        "jest",
+        "pytest",
+        "go test",
+        "playwright test",
+        "cypress",
+        "rspec",
+        "phpunit",
+        "e2e",
+    ];
+
+    TEST_MARKERS.iter().any(|marker| haystack.contains(marker))
+}
+
+fn tool_log_looks_failed(entry: &ToolLogEntry) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        entry.tool_name,
+        entry.input_summary,
+        extract_tool_command(entry),
+        entry.output_summary
+    )
+    .to_ascii_lowercase();
+    const FAILURE_MARKERS: &[&str] = &[
+        " fail",
+        "failed",
+        " error",
+        "panic",
+        "timed out",
+        "non-zero",
+        "exit code 1",
+        "exited with",
+    ];
+
+    FAILURE_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+}
+
+fn tool_log_looks_passed(entry: &ToolLogEntry) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        entry.tool_name,
+        entry.input_summary,
+        extract_tool_command(entry),
+        entry.output_summary
+    )
+    .to_ascii_lowercase();
+    const SUCCESS_MARKERS: &[&str] = &[" pass", "passed", " ok", "success", "green", "completed"];
+
+    SUCCESS_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+}
+
+fn extract_tool_command(entry: &ToolLogEntry) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&entry.input_params_json) else {
+        return String::new();
+    };
+
+    value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+fn recent_completion_files(file_activity: &[FileActivityEntry], files_changed: u32) -> Vec<String> {
+    if !file_activity.is_empty() {
+        return file_activity
+            .iter()
+            .take(3)
+            .map(file_activity_summary)
+            .collect();
+    }
+
+    if files_changed > 0 {
+        return vec![format!("files touched {}", files_changed)];
+    }
+
+    Vec::new()
+}
+
+fn summarize_completion_decisions(
+    tool_logs: &[ToolLogEntry],
+    file_activity: &[FileActivityEntry],
+    session_task: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut decisions = Vec::new();
+
+    for entry in tool_logs.iter().rev() {
+        let mut candidates = Vec::new();
+        if !entry.trigger_summary.trim().is_empty()
+            && entry.trigger_summary.trim() != session_task.trim()
+        {
+            candidates.push(format!(
+                "why {}",
+                truncate_for_dashboard(&entry.trigger_summary, 72)
+            ));
+        }
+
+        let action = if entry.tool_name.eq_ignore_ascii_case("Bash") {
+            truncate_for_dashboard(&extract_tool_command(entry), 72)
+        } else if !entry.output_summary.trim().is_empty() && entry.output_summary.trim() != "ok" {
+            truncate_for_dashboard(&entry.output_summary, 72)
+        } else {
+            truncate_for_dashboard(&entry.input_summary, 72)
+        };
+
+        if !action.trim().is_empty() {
+            candidates.push(action);
+        }
+
+        for candidate in candidates {
+            let normalized = candidate.to_ascii_lowercase();
+            if seen.insert(normalized) {
+                decisions.push(candidate);
+            }
+            if decisions.len() >= 3 {
+                return decisions;
+            }
+        }
+    }
+
+    for entry in file_activity.iter().take(3) {
+        let candidate = file_activity_summary(entry);
+        let normalized = candidate.to_ascii_lowercase();
+        if seen.insert(normalized) {
+            decisions.push(candidate);
+        }
+        if decisions.len() >= 3 {
+            break;
+        }
+    }
+
+    decisions
+}
+
+fn summarize_completion_warnings(
+    session: &Session,
+    tool_logs: &[ToolLogEntry],
+    tests: &TestRunSummary,
+    worktree_health: Option<&worktree::WorktreeHealth>,
+    approval_backlog: usize,
+    overlap_count: usize,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let high_risk_tool_calls = tool_logs
+        .iter()
+        .filter(|entry| entry.risk_score >= Config::RISK_THRESHOLDS.review)
+        .count();
+
+    if session.metrics.files_changed > 0 && tests.total == 0 {
+        warnings.push("no test runs detected".to_string());
+    }
+    if tests.total > tests.passed {
+        warnings.push(format!(
+            "{} detected test run(s) were not confirmed passed",
+            tests.total - tests.passed
+        ));
+    }
+    if high_risk_tool_calls > 0 {
+        warnings.push(format!(
+            "{high_risk_tool_calls} high-risk tool call(s) recorded"
+        ));
+    }
+    if approval_backlog > 0 {
+        warnings.push(format!(
+            "{approval_backlog} approval/conflict request(s) remained unread"
+        ));
+    }
+    if overlap_count > 0 {
+        warnings.push(format!(
+            "{overlap_count} potential file overlap(s) remained"
+        ));
+    }
+    match worktree_health {
+        Some(worktree::WorktreeHealth::Conflicted) => {
+            warnings.push("worktree still has unresolved conflicts".to_string());
+        }
+        Some(worktree::WorktreeHealth::InProgress) => {
+            warnings.push("worktree still has unmerged changes".to_string());
+        }
+        Some(worktree::WorktreeHealth::Clear) | None => {}
+    }
+
+    warnings
+}
+
+fn completion_summary_observation_details(
+    summary: &SessionCompletionSummary,
+    session: &Session,
+) -> BTreeMap<String, String> {
+    let mut details = BTreeMap::new();
+    details.insert("state".to_string(), session.state.to_string());
+    details.insert(
+        "files_changed".to_string(),
+        summary.files_changed.to_string(),
+    );
+    details.insert("tokens_used".to_string(), summary.tokens_used.to_string());
+    details.insert(
+        "duration_secs".to_string(),
+        summary.duration_secs.to_string(),
+    );
+    details.insert("cost_usd".to_string(), format!("{:.4}", summary.cost_usd));
+    details.insert("tests_run".to_string(), summary.tests_run.to_string());
+    details.insert("tests_passed".to_string(), summary.tests_passed.to_string());
+    if !summary.recent_files.is_empty() {
+        details.insert("recent_files".to_string(), summary.recent_files.join(" | "));
+    }
+    if !summary.key_decisions.is_empty() {
+        details.insert(
+            "key_decisions".to_string(),
+            summary.key_decisions.join(" | "),
+        );
+    }
+    if !summary.warnings.is_empty() {
+        details.insert("warnings".to_string(), summary.warnings.join(" | "));
+    }
+    details
+}
+
+fn session_started_webhook_body(session: &Session, compare_url: Option<&str>) -> String {
+    let mut lines = vec![
+        "*ECC 2.0: Session started*".to_string(),
+        format!(
+            "`{}` {}",
+            format_session_id(&session.id),
+            truncate_for_dashboard(&session.task, 96)
+        ),
+        format!(
+            "Project `{}` | Group `{}` | Agent `{}`",
+            session.project, session.task_group, session.agent_type
+        ),
+    ];
+
+    if let Some(worktree) = session.worktree.as_ref() {
+        lines.push(format!(
+            "```text\nbranch: {}\nbase: {}\nworktree: {}\n```",
+            worktree.branch,
+            worktree.base_branch,
+            worktree.path.display()
+        ));
+    }
+
+    if let Some(compare_url) = compare_url {
+        lines.push(format!("PR / compare: {compare_url}"));
+    }
+
+    lines.join("\n")
+}
+
+fn completion_summary_webhook_body(
+    summary: &SessionCompletionSummary,
+    session: &Session,
+    compare_url: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("*{}*", summary.title()),
+        format!(
+            "`{}` {}",
+            format_session_id(&summary.session_id),
+            truncate_for_dashboard(&summary.task, 96)
+        ),
+        format!(
+            "Project `{}` | Group `{}` | State `{}`",
+            session.project, session.task_group, session.state
+        ),
+        format!(
+            "Duration `{}` | Files `{}` | Tokens `{}` | Cost `{}`",
+            format_duration(summary.duration_secs),
+            summary.files_changed,
+            format_token_count(summary.tokens_used),
+            format_currency(summary.cost_usd)
+        ),
+        if summary.tests_run > 0 {
+            format!(
+                "Tests `{}` run / `{}` passed",
+                summary.tests_run, summary.tests_passed
+            )
+        } else {
+            "Tests `not detected`".to_string()
+        },
+    ];
+
+    if !summary.recent_files.is_empty() {
+        lines.push(markdown_code_block("Recent files", &summary.recent_files));
+    }
+
+    if !summary.key_decisions.is_empty() {
+        lines.push(markdown_code_block("Key decisions", &summary.key_decisions));
+    }
+
+    if !summary.warnings.is_empty() {
+        lines.push(markdown_code_block("Warnings", &summary.warnings));
+    }
+
+    if let Some(compare_url) = compare_url {
+        lines.push(format!("PR / compare: {compare_url}"));
+    }
+
+    lines.join("\n")
+}
+
+fn budget_alert_webhook_body(
+    summary_suffix: &str,
+    token_budget: &str,
+    cost_budget: &str,
+    active_sessions: usize,
+) -> String {
+    [
+        "*ECC 2.0: Budget alert*".to_string(),
+        summary_suffix.to_string(),
+        format!("Tokens `{token_budget}`"),
+        format!("Cost `{cost_budget}`"),
+        format!("Active sessions `{active_sessions}`"),
+    ]
+    .join("\n")
+}
+
+fn approval_request_webhook_body(message: &SessionMessage, preview: &str) -> String {
+    [
+        "*ECC 2.0: Approval needed*".to_string(),
+        format!(
+            "To `{}` from `{}`",
+            format_session_id(&message.to_session),
+            format_session_id(&message.from_session)
+        ),
+        format!("Type `{}`", message.msg_type),
+        markdown_code_block("Request", &[preview.to_string()]),
+    ]
+    .join("\n")
+}
+
+fn markdown_code_block(label: &str, lines: &[String]) -> String {
+    format!("{label}\n```text\n{}\n```", lines.join("\n"))
+}
+
+fn session_compare_url(session: &Session) -> Option<String> {
+    session
+        .worktree
+        .as_ref()
+        .and_then(|worktree| worktree::github_compare_url(worktree).ok().flatten())
+}
+
+fn file_activity_verb(action: crate::session::FileActivityAction) -> &'static str {
+    match action {
+        crate::session::FileActivityAction::Read => "read",
+        crate::session::FileActivityAction::Create => "create",
+        crate::session::FileActivityAction::Modify => "modify",
+        crate::session::FileActivityAction::Move => "move",
+        crate::session::FileActivityAction::Delete => "delete",
+        crate::session::FileActivityAction::Touch => "touch",
+    }
+}
+
+fn heartbeat_enforcement_note(outcome: &manager::HeartbeatEnforcementOutcome) -> String {
+    if !outcome.auto_terminated_sessions.is_empty() {
+        return format!(
+            "stale heartbeat detected | auto-terminated {} session(s)",
+            outcome.auto_terminated_sessions.len()
+        );
+    }
+
+    format!(
+        "stale heartbeat detected | flagged {} session(s) for attention",
+        outcome.stale_sessions.len()
+    )
+}
+
+fn budget_auto_pause_note(outcome: &manager::BudgetEnforcementOutcome) -> String {
+    let cause = match (
+        outcome.token_budget_exceeded,
+        outcome.cost_budget_exceeded,
+        outcome.profile_token_budget_exceeded,
+    ) {
+        (true, true, _) => "token and cost budgets exceeded",
+        (true, false, _) => "token budget exceeded",
+        (false, true, _) => "cost budget exceeded",
+        (false, false, true) => "profile token budget exceeded",
+        (false, false, false) => "budget exceeded",
+    };
+
+    format!(
+        "{cause} | auto-paused {} active session(s)",
+        outcome.paused_sessions.len()
+    )
+}
+
+fn conflict_enforcement_note(outcome: &manager::ConflictEnforcementOutcome) -> String {
+    let strategy = match outcome.strategy {
+        crate::config::ConflictResolutionStrategy::Escalate => "escalation",
+        crate::config::ConflictResolutionStrategy::LastWriteWins => "last-write-wins",
+        crate::config::ConflictResolutionStrategy::Merge => "merge review",
+    };
+
+    format!(
+        "file conflict detected | opened {} incident(s), auto-paused {} session(s) via {}",
+        outcome.created_incidents,
+        outcome.paused_sessions.len(),
+        strategy
+    )
 }
 
 fn format_session_id(id: &str) -> String {
@@ -5344,6 +9223,44 @@ fn build_conflict_protocol(
     Some(lines.join("\n"))
 }
 
+fn build_session_conflict_protocol(
+    session_id: &str,
+    incidents: &[crate::session::store::ConflictIncident],
+) -> Option<String> {
+    if incidents.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        format!("Conflict protocol for {}", format_session_id(session_id)),
+        "Session overlap incidents".to_string(),
+    ];
+
+    for incident in incidents {
+        lines.push(format!(
+            "- {}",
+            conflict_incident_summary(
+                incident,
+                &incident.updated_at.format("%H:%M:%S").to_string()
+            )
+        ));
+        lines.push(format!("  {}", incident.summary));
+    }
+
+    lines.push("Resolution steps".to_string());
+    lines.push("1. Inspect the affected session output and recent file activity".to_string());
+    lines.push(
+        "2. Decide whether to keep the active session, reassign, or merge changes manually"
+            .to_string(),
+    );
+    lines.push(format!(
+        "3. Resume the paused session only after reviewing the overlap: ecc resume {}",
+        session_id
+    ));
+
+    Some(lines.join("\n"))
+}
+
 fn assignment_action_label(action: manager::AssignmentAction) -> &'static str {
     match action {
         manager::AssignmentAction::Spawned => "spawned",
@@ -5351,6 +9268,59 @@ fn assignment_action_label(action: manager::AssignmentAction) -> &'static str {
         manager::AssignmentAction::ReusedActive => "reused active",
         manager::AssignmentAction::DeferredSaturated => "deferred saturated",
     }
+}
+
+fn parse_pr_prompt(input: &str) -> std::result::Result<PrPromptSpec, String> {
+    let mut segments = input.split('|').map(str::trim);
+    let title = segments.next().unwrap_or_default().trim().to_string();
+    if title.is_empty() {
+        return Err("missing PR title".to_string());
+    }
+
+    let mut request = PrPromptSpec {
+        title,
+        base_branch: None,
+        labels: Vec::new(),
+        reviewers: Vec::new(),
+    };
+
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        let (key, value) = segment
+            .split_once('=')
+            .ok_or_else(|| format!("expected key=value segment, got `{segment}`"))?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "base" => {
+                if value.is_empty() {
+                    return Err("base branch cannot be empty".to_string());
+                }
+                request.base_branch = Some(value.to_string());
+            }
+            "labels" | "label" => {
+                request.labels = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
+            "reviewers" | "reviewer" => {
+                request.reviewers = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
+            _ => return Err(format!("unsupported PR field `{key}`")),
+        }
+    }
+
+    Ok(request)
 }
 
 fn delegate_worktree_health_label(health: worktree::WorktreeHealth) -> &'static str {
@@ -5381,6 +9351,7 @@ fn delegate_next_action(delegate: &DelegatedChildSummary) -> &'static str {
         SessionState::Pending => "wait for startup",
         SessionState::Running => "let it run",
         SessionState::Idle => "assign next task",
+        SessionState::Stale => "inspect stale heartbeat",
         SessionState::Failed => "inspect failure",
         SessionState::Stopped => "resume or reassign",
         SessionState::Completed => "merge or cleanup",
@@ -5394,7 +9365,10 @@ fn delegate_attention_priority(delegate: &DelegatedChildSummary) -> u8 {
     if delegate.approval_backlog > 0 {
         return 1;
     }
-    if matches!(delegate.state, SessionState::Failed | SessionState::Stopped) {
+    if matches!(
+        delegate.state,
+        SessionState::Stale | SessionState::Failed | SessionState::Stopped
+    ) {
         return 2;
     }
     if delegate.handoff_backlog > 0 {
@@ -5408,7 +9382,7 @@ fn delegate_attention_priority(delegate: &DelegatedChildSummary) -> u8 {
         SessionState::Running => 6,
         SessionState::Idle => 7,
         SessionState::Completed => 8,
-        SessionState::Failed | SessionState::Stopped => unreachable!(),
+        SessionState::Stale | SessionState::Failed | SessionState::Stopped => unreachable!(),
     }
 }
 
@@ -5420,6 +9394,44 @@ fn session_branch(session: &Session) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn board_progress_bar(progress_percent: i64) -> String {
+    let clamped = progress_percent.clamp(0, 100);
+    let filled = ((clamped + 9) / 10) as usize;
+    let empty = 10usize.saturating_sub(filled);
+    format!("[{}{}]", "#".repeat(filled), ".".repeat(empty))
+}
+
+fn board_presence_marker(session: &Session) -> String {
+    let codename = board_codename(session);
+    let initials = codename
+        .split_whitespace()
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    format!("@{initials}")
+}
+
+fn board_motion_marker(meta: &SessionBoardMeta) -> &'static str {
+    match meta.movement_note.as_deref() {
+        Some("Blocked") => "x",
+        Some("Completed") => "*",
+        Some(note) if note.starts_with("Moved ") => ">",
+        Some(note) if note.starts_with("Retargeted ") => "~",
+        _ => ".",
+    }
+}
+
+fn board_activity_marker(meta: &SessionBoardMeta) -> &'static str {
+    match meta.activity_kind.as_deref() {
+        Some("received") => "<",
+        Some("delegated") => ">",
+        Some("spawned") => "+",
+        Some("spawned_fallback") => "#",
+        _ => "",
+    }
+}
+
 fn format_duration(duration_secs: u64) -> String {
     let hours = duration_secs / 3600;
     let minutes = (duration_secs % 3600) / 60;
@@ -5427,7 +9439,7 @@ fn format_duration(duration_secs: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn cost_metrics_signature(path: &std::path::Path) -> Option<(u64, u128)> {
+fn metrics_file_signature(path: &std::path::Path) -> Option<(u64, u128)> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata
         .modified()
@@ -5487,8 +9499,9 @@ mod tests {
 
         let rendered = render_dashboard_text(dashboard, 220, 24);
         assert!(rendered.contains("ID"));
+        assert!(rendered.contains("Project"));
+        assert!(rendered.contains("Group"));
         assert!(rendered.contains("Branch"));
-        assert!(rendered.contains("Tool Files"));
         assert!(rendered.contains("Total 2"));
         assert!(rendered.contains("Running 1"));
         assert!(rendered.contains("Completed 1"));
@@ -5556,6 +9569,42 @@ mod tests {
         dashboard.sync_selected_messages();
 
         assert_eq!(dashboard.approval_queue_counts.get("worker-123456"), None);
+        assert!(dashboard.approval_queue_preview.is_empty());
+    }
+
+    #[test]
+    fn refresh_tracks_latest_unread_approval_before_selected_messages_mark_read() {
+        let sessions = vec![sample_session(
+            "worker-123456",
+            "reviewer",
+            SessionState::Idle,
+            Some("ecc/worker"),
+            64,
+            5,
+        )];
+        let mut dashboard = test_dashboard(sessions, 0);
+        for session in &dashboard.sessions {
+            dashboard.db.insert_session(session).unwrap();
+        }
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-123456",
+                "{\"question\":\"Need operator input\"}",
+                "query",
+            )
+            .unwrap();
+        let message_id = dashboard
+            .db
+            .latest_unread_approval_message()
+            .unwrap()
+            .expect("approval message should exist")
+            .id;
+
+        dashboard.refresh();
+
+        assert_eq!(dashboard.last_seen_approval_message_id, Some(message_id));
         assert!(dashboard.approval_queue_preview.is_empty());
     }
 
@@ -5798,6 +9847,427 @@ mod tests {
     }
 
     #[test]
+    fn toggle_git_status_mode_renders_selected_worktree_status() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-git-status-{}", Uuid::new_v4()));
+        init_git_repo(&root)?;
+        fs::write(root.join("README.md"), "hello from git status\n")?;
+
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.working_dir = root.clone();
+        session.worktree = Some(WorktreeInfo {
+            path: root.clone(),
+            branch: "main".to_string(),
+            base_branch: "main".to_string(),
+        });
+        let mut dashboard = test_dashboard(vec![session], 0);
+
+        dashboard.toggle_git_status_mode();
+
+        assert_eq!(dashboard.output_mode, OutputMode::GitStatus);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("showing selected worktree git status")
+        );
+        assert_eq!(
+            dashboard.output_title(),
+            " Git status staged:0 unstaged:1 1/1 "
+        );
+        let rendered = dashboard.rendered_output_text(180, 20);
+        assert!(rendered.contains("Git status"));
+        assert!(rendered.contains("README.md"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn toggle_output_mode_from_git_status_opens_selected_file_patch() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-git-patch-view-{}", Uuid::new_v4()));
+        init_git_repo(&root)?;
+        fs::write(
+            root.join("README.md"),
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6 updated\n",
+        )?;
+
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.working_dir = root.clone();
+        session.worktree = Some(WorktreeInfo {
+            path: root.clone(),
+            branch: "main".to_string(),
+            base_branch: "main".to_string(),
+        });
+        let mut dashboard = test_dashboard(vec![session], 0);
+        let stored = dashboard.sessions[0].clone();
+        dashboard.db.insert_session(&stored)?;
+
+        dashboard.toggle_git_status_mode();
+        dashboard.toggle_output_mode();
+
+        assert_eq!(dashboard.output_mode, OutputMode::GitPatch);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("showing selected file patch")
+        );
+        assert!(dashboard.output_title().contains("Git patch README.md"));
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Git patch README.md"));
+        assert!(rendered.contains("+line 6 updated"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn git_patch_mode_stages_only_selected_hunk() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-git-patch-stage-{}", Uuid::new_v4()));
+        init_git_repo(&root)?;
+        let original = (1..=12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("notes.txt"), format!("{original}\n"))?;
+        run_git(&root, &["add", "notes.txt"])?;
+        run_git(&root, &["commit", "-qm", "add notes"])?;
+
+        let updated = (1..=12)
+            .map(|index| match index {
+                2 => "line 2 changed".to_string(),
+                11 => "line 11 changed".to_string(),
+                _ => format!("line {index}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("notes.txt"), format!("{updated}\n"))?;
+
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.working_dir = root.clone();
+        session.worktree = Some(WorktreeInfo {
+            path: root.clone(),
+            branch: "main".to_string(),
+            base_branch: "main".to_string(),
+        });
+        let mut dashboard = test_dashboard(vec![session], 0);
+        let stored = dashboard.sessions[0].clone();
+        dashboard.db.insert_session(&stored)?;
+
+        dashboard.toggle_git_status_mode();
+        dashboard.toggle_output_mode();
+        dashboard.stage_selected_git_status();
+
+        assert_eq!(dashboard.output_mode, OutputMode::GitPatch);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("staged hunk in notes.txt")
+        );
+        let cached = git_stdout(&root, &["diff", "--cached", "--", "notes.txt"])?;
+        assert!(cached.contains("line 2 changed"));
+        assert!(!cached.contains("line 11 changed"));
+        let working = git_stdout(&root, &["diff", "--", "notes.txt"])?;
+        assert!(!working.contains("line 2 changed"));
+        assert!(working.contains("line 11 changed"));
+        assert!(dashboard.output_title().contains("Git patch notes.txt"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn begin_commit_prompt_opens_commit_input_for_staged_entries() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        dashboard.output_mode = OutputMode::GitStatus;
+        dashboard.selected_git_status_entries = vec![worktree::GitStatusEntry {
+            path: "README.md".to_string(),
+            display_path: "README.md".to_string(),
+            index_status: 'M',
+            worktree_status: ' ',
+            staged: true,
+            unstaged: false,
+            untracked: false,
+            conflicted: false,
+        }];
+
+        dashboard.begin_commit_prompt();
+
+        assert_eq!(dashboard.commit_input.as_deref(), Some(""));
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("commit mode | type a message and press Enter")
+        );
+        let rendered = render_dashboard_text(dashboard, 180, 20);
+        assert!(rendered.contains("commit>_"));
+    }
+
+    #[test]
+    fn begin_pr_prompt_seeds_latest_commit_subject() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-pr-prompt-{}", Uuid::new_v4()));
+        init_git_repo(&root)?;
+        fs::write(root.join("README.md"), "seed pr title\n")?;
+        run_git(&root, &["commit", "-am", "seed pr title"])?;
+
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.working_dir = root.clone();
+        session.worktree = Some(WorktreeInfo {
+            path: root.clone(),
+            branch: "main".to_string(),
+            base_branch: "main".to_string(),
+        });
+        let mut dashboard = test_dashboard(vec![session], 0);
+
+        dashboard.begin_pr_prompt();
+
+        assert_eq!(dashboard.pr_input.as_deref(), Some("seed pr title"));
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("pr mode | title | base=branch | labels=a,b | reviewers=a,b")
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pr_prompt_supports_base_labels_and_reviewers() {
+        let parsed = parse_pr_prompt(
+            "Improve retry flow | base=release/2.0 | labels=billing, ux | reviewers=alice, bob",
+        )
+        .expect("parse prompt");
+
+        assert_eq!(parsed.title, "Improve retry flow");
+        assert_eq!(parsed.base_branch.as_deref(), Some("release/2.0"));
+        assert_eq!(parsed.labels, vec!["billing", "ux"]);
+        assert_eq!(parsed.reviewers, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn submit_pr_prompt_passes_custom_metadata_to_gh() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("ecc2-dashboard-pr-submit-{}", Uuid::new_v4()));
+        let root = temp_root.join("repo");
+        init_git_repo(&root)?;
+        let remote = temp_root.join("remote.git");
+        run_git(
+            &root,
+            &["init", "--bare", remote.to_str().expect("utf8 path")],
+        )?;
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf8 path"),
+            ],
+        )?;
+        run_git(&root, &["push", "-u", "origin", "main"])?;
+        run_git(&root, &["checkout", "-b", "feat/dashboard-pr"])?;
+        fs::write(root.join("README.md"), "dashboard pr\n")?;
+        run_git(&root, &["commit", "-am", "dashboard pr"])?;
+
+        let bin_dir = temp_root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        let gh_path = bin_dir.join("gh");
+        let args_path = temp_root.join("gh-dashboard-args.txt");
+        fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' 'https://github.com/example/repo/pull/789'\n",
+                args_path.display()
+            ),
+        )?;
+        let mut perms = fs::metadata(&gh_path)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            fs::set_permissions(&gh_path, perms)?;
+        }
+        #[cfg(not(unix))]
+        fs::set_permissions(&gh_path, perms)?;
+
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                original_path
+                    .as_deref()
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .unwrap_or_default()
+            ),
+        );
+
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.working_dir = root.clone();
+        session.worktree = Some(WorktreeInfo {
+            path: root.clone(),
+            branch: "feat/dashboard-pr".to_string(),
+            base_branch: "main".to_string(),
+        });
+        let mut dashboard = test_dashboard(vec![session], 0);
+        dashboard.pr_input = Some(
+            "Improve retry flow | base=release/2.0 | labels=billing,ux | reviewers=alice,bob"
+                .to_string(),
+        );
+
+        dashboard.submit_pr_prompt();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("created draft PR for focus-12 against release/2.0: https://github.com/example/repo/pull/789")
+        );
+        let gh_args = fs::read_to_string(&args_path)?;
+        assert!(gh_args.contains("--base\nrelease/2.0"));
+        assert!(gh_args.contains("--label\nbilling"));
+        assert!(gh_args.contains("--label\nux"));
+        assert!(gh_args.contains("--reviewer\nalice"));
+        assert!(gh_args.contains("--reviewer\nbob"));
+
+        if let Some(path) = original_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = fs::remove_dir_all(temp_root);
+        Ok(())
+    }
+
+    #[test]
+    fn toggle_diff_view_mode_switches_to_unified_rendering() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        let patch = "--- Branch diff vs main ---\n\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old line\n\
++new line"
+            .to_string();
+        dashboard.selected_diff_summary = Some("1 file changed".to_string());
+        dashboard.selected_diff_patch = Some(patch.clone());
+        dashboard.selected_diff_hunk_offsets_split =
+            build_worktree_diff_columns(&patch, dashboard.theme_palette()).hunk_offsets;
+        dashboard.selected_diff_hunk_offsets_unified = build_unified_diff_hunk_offsets(&patch);
+        dashboard.toggle_output_mode();
+
+        dashboard.toggle_diff_view_mode();
+
+        assert_eq!(dashboard.diff_view_mode, DiffViewMode::Unified);
+        assert_eq!(dashboard.output_title(), " Diff unified 1/1 ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("diff view set to unified")
+        );
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Diff unified 1/1"));
+        assert!(rendered.contains("@@ -1 +1 @@"));
+        assert!(rendered.contains("-old line"));
+        assert!(rendered.contains("+new line"));
+        assert!(!rendered.contains("Removals"));
+        assert!(!rendered.contains("Additions"));
+    }
+
+    #[test]
+    fn diff_hunk_navigation_updates_scroll_offset_and_wraps() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        let patch = "--- Branch diff vs main ---\n\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old line\n\
++new line\n\
+@@ -5 +5 @@\n\
+-second old\n\
++second new"
+            .to_string();
+        dashboard.selected_diff_patch = Some(patch.clone());
+        let split_offsets =
+            build_worktree_diff_columns(&patch, dashboard.theme_palette()).hunk_offsets;
+        dashboard.selected_diff_hunk_offsets_split = split_offsets.clone();
+        dashboard.selected_diff_hunk_offsets_unified = build_unified_diff_hunk_offsets(&patch);
+        dashboard.output_mode = OutputMode::WorktreeDiff;
+
+        dashboard.next_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 1);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[1]);
+        assert_eq!(dashboard.output_title(), " Diff split 2/2 ");
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 2/2"));
+
+        dashboard.next_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 0);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[0]);
+        assert_eq!(dashboard.output_title(), " Diff split 1/2 ");
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 1/2"));
+
+        dashboard.prev_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 1);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[1]);
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 2/2"));
+    }
+
+    #[test]
     fn toggle_timeline_mode_renders_selected_session_events() {
         let now = Utc::now();
         let mut session = sample_session(
@@ -5829,7 +10299,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{\"command\":\"cargo test -q\"}",
                 "ok",
+                "stabilize planner session",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -5848,7 +10320,9 @@ mod tests {
         assert!(rendered.contains("created session as planner"));
         assert!(rendered.contains("received query lead-123"));
         assert!(rendered.contains("tool bash"));
-        assert!(rendered.contains("files changed 3"));
+        assert!(rendered.contains("why stabilize planner session"));
+        assert!(rendered.contains("params {\"command\":\"cargo test -q\"}"));
+        assert!(rendered.contains("files touched 3"));
     }
 
     #[test]
@@ -5883,7 +10357,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -5907,7 +10383,170 @@ mod tests {
         let rendered = dashboard.rendered_output_text(180, 30);
         assert!(rendered.contains("received query lead-123"));
         assert!(!rendered.contains("tool bash"));
-        assert!(!rendered.contains("files changed 1"));
+        assert!(!rendered.contains("files touched 1"));
+    }
+
+    #[test]
+    fn timeline_and_metrics_render_recent_file_activity_details() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-file-activity-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let now = Utc::now();
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.created_at = now - chrono::Duration::hours(2);
+        session.updated_at = now - chrono::Duration::minutes(5);
+
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+
+        let metrics_path = root.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"updated readme\",\"file_paths\":[\"README.md\"],\"file_events\":[{\"path\":\"README.md\",\"action\":\"create\",\"diff_preview\":\"+ # ECC 2.0\",\"patch_preview\":\"+ # ECC 2.0\\n+ \\n+ A richer dashboard\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+        dashboard.db.sync_tool_activity_metrics(&metrics_path)?;
+        dashboard.sync_from_store();
+
+        dashboard.toggle_timeline_mode();
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("read src/lib.rs"));
+        assert!(rendered.contains("create README.md"));
+        assert!(rendered.contains("+ # ECC 2.0"));
+        assert!(rendered.contains("+ A richer dashboard"));
+        assert!(!rendered.contains("files touched 2"));
+
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Recent file activity"));
+        assert!(metrics_text.contains("create README.md"));
+        assert!(metrics_text.contains("+ # ECC 2.0"));
+        assert!(metrics_text.contains("+ A richer dashboard"));
+        assert!(metrics_text.contains("read src/lib.rs"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_text_surfaces_file_activity_conflicts() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-file-overlaps-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let now = Utc::now();
+        let mut focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        focus.created_at = now - chrono::Duration::hours(1);
+        focus.updated_at = now - chrono::Duration::minutes(3);
+
+        let mut delegate = sample_session(
+            "delegate-87654321",
+            "coder",
+            SessionState::Idle,
+            Some("ecc/delegate"),
+            256,
+            12,
+        );
+        delegate.created_at = now - chrono::Duration::minutes(50);
+        delegate.updated_at = now - chrono::Duration::minutes(2);
+
+        let mut dashboard = test_dashboard(vec![focus.clone(), delegate.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&delegate)?;
+
+        let metrics_path = root.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"updated lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"delegate-87654321\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"touched lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+        dashboard.db.sync_tool_activity_metrics(&metrics_path)?;
+        dashboard.sync_from_store();
+
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Active conflicts"));
+        assert!(metrics_text.contains("src/lib.rs"));
+        assert!(metrics_text.contains("escalate"));
+        assert_eq!(
+            dashboard
+                .db
+                .get_session("delegate-87654321")?
+                .expect("delegate should exist")
+                .state,
+            SessionState::Stopped
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_and_metrics_render_decision_log_entries() -> Result<()> {
+        let now = Utc::now();
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            256,
+            7,
+        );
+        session.created_at = now - chrono::Duration::hours(1);
+        session.updated_at = now - chrono::Duration::minutes(2);
+
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+        dashboard.db.insert_decision(
+            &session.id,
+            "Use sqlite for the shared context graph",
+            &["json files".to_string(), "memory only".to_string()],
+            "SQLite keeps the audit trail queryable from CLI and TUI.",
+        )?;
+
+        dashboard.toggle_timeline_mode();
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("decision"));
+        assert!(rendered.contains("decided Use sqlite for the shared context graph"));
+        assert!(rendered.contains("why SQLite keeps the audit trail queryable"));
+        assert!(rendered.contains("alternative json files"));
+        assert!(rendered.contains("alternative memory only"));
+
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Recent decisions"));
+        assert!(metrics_text.contains("decided Use sqlite for the shared context graph"));
+        assert!(metrics_text.contains("alternative json files"));
+
+        dashboard.cycle_timeline_event_filter();
+        dashboard.cycle_timeline_event_filter();
+        dashboard.cycle_timeline_event_filter();
+        dashboard.cycle_timeline_event_filter();
+        dashboard.cycle_timeline_event_filter();
+
+        assert_eq!(
+            dashboard.timeline_event_filter,
+            TimelineEventFilter::Decisions
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("timeline filter set to decisions")
+        );
+        assert_eq!(dashboard.output_title(), " Timeline decisions ");
+
+        Ok(())
     }
 
     #[test]
@@ -5932,7 +10571,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -5991,7 +10632,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(4)).to_rfc3339(),
@@ -6003,7 +10646,9 @@ mod tests {
                 "review-87654321",
                 "git",
                 "git status --short",
+                "{}",
                 "ok",
+                "",
                 120,
                 0.1,
                 &(now - chrono::Duration::minutes(2)).to_rfc3339(),
@@ -6028,6 +10673,320 @@ mod tests {
     }
 
     #[test]
+    fn toggle_context_graph_mode_renders_selected_session_entities_and_relations() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+
+        let file = dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "dashboard renderer",
+            &std::collections::BTreeMap::new(),
+        )?;
+        let function = dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "function",
+            "render_output",
+            None,
+            "renders the output pane",
+            &std::collections::BTreeMap::new(),
+        )?;
+        dashboard.db.upsert_context_relation(
+            Some(&session.id),
+            file.id,
+            function.id,
+            "contains",
+            "output rendering path",
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+
+        assert_eq!(dashboard.output_mode, OutputMode::ContextGraph);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("showing selected session context graph")
+        );
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Graph"));
+        assert!(rendered.contains("dashboard.rs"));
+        assert!(rendered.contains("summary dashboard renderer"));
+        assert!(rendered.contains("-> contains function:render_output"));
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_graph_entity_filter_limits_rendered_entities() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+        dashboard.db.insert_decision(
+            &session.id,
+            "Use sqlite graph sync",
+            &[],
+            "Keeps shared memory queryable",
+        )?;
+        dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "dashboard renderer",
+            &std::collections::BTreeMap::new(),
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.cycle_graph_entity_filter();
+
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Decisions);
+        assert_eq!(dashboard.output_title(), " Graph decisions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Use sqlite graph sync"));
+        assert!(!rendered.contains("dashboard.rs"));
+
+        dashboard.cycle_graph_entity_filter();
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Files);
+        assert_eq!(dashboard.output_title(), " Graph files ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("dashboard.rs"));
+        assert!(!rendered.contains("Use sqlite graph sync"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_scope_all_sessions_renders_cross_session_entities() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let review = sample_session(
+            "review-87654321",
+            "reviewer",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&review)?;
+        dashboard
+            .db
+            .insert_decision(&focus.id, "Alpha graph path", &[], "planner path")?;
+        dashboard
+            .db
+            .insert_decision(&review.id, "Beta graph path", &[], "review path")?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.toggle_search_scope();
+
+        assert_eq!(dashboard.search_scope, SearchScope::AllSessions);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("graph scope set to all sessions")
+        );
+        assert_eq!(dashboard.output_title(), " Graph all sessions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("focus-12"));
+        assert!(rendered.contains("review-8"));
+        assert!(rendered.contains("Alpha graph path"));
+        assert!(rendered.contains("Beta graph path"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_search_matches_and_switches_selected_session() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let review = sample_session(
+            "review-87654321",
+            "reviewer",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&review)?;
+        dashboard
+            .db
+            .insert_decision(&focus.id, "alpha local graph", &[], "planner path")?;
+        dashboard
+            .db
+            .insert_decision(&review.id, "alpha remote graph", &[], "review path")?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.toggle_search_scope();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.begin_search();
+        for ch in "alpha.*".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Decisions);
+        assert_eq!(dashboard.search_matches.len(), 2);
+        let first_session = dashboard.selected_session_id().map(str::to_string);
+        dashboard.next_search_match();
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("graph search /alpha.* match 2/2 | all sessions")
+        );
+        assert_ne!(
+            dashboard.selected_session_id().map(str::to_string),
+            first_session
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_sessions_filter_renders_auto_session_relations() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+        dashboard.db.insert_decision(
+            &session.id,
+            "Use graph relations",
+            &[],
+            "Edges make the context graph navigable",
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Sessions);
+        assert_eq!(dashboard.output_title(), " Graph sessions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("focus-12345678"));
+        assert!(rendered.contains("summary running | planner |"));
+        assert!(rendered.contains("-> decided decision:Use graph relations"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_context_graph_relations() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let delegate = sample_session("delegate-87654321", "coder", SessionState::Idle, None, 1, 1);
+        let dashboard = test_dashboard(vec![focus.clone(), delegate.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&delegate)?;
+        dashboard.db.insert_decision(
+            &focus.id,
+            "Use sqlite graph sync",
+            &[],
+            "Keeps shared memory queryable",
+        )?;
+        dashboard.db.send_message(
+            &focus.id,
+            &delegate.id,
+            "{\"task\":\"Review graph edge\",\"context\":\"coordination smoke\"}",
+            "task_handoff",
+        )?;
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(text.contains("Context graph"));
+        assert!(text.contains("outgoing 2 | incoming 0"));
+        assert!(text.contains("-> decided decision:Use sqlite graph sync"));
+        assert!(text.contains("-> delegates_to session:delegate-87654321"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_relevant_memory() -> Result<()> {
+        let mut focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        focus.task = "Investigate auth callback recovery".to_string();
+        let mut memory = sample_session("memory-87654321", "coder", SessionState::Idle, None, 1, 1);
+        memory.task = "Auth callback recovery notes".to_string();
+        let dashboard = test_dashboard(vec![focus.clone(), memory.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&memory)?;
+        dashboard.db.upsert_context_entity(
+            Some(&memory.id),
+            "file",
+            "callback.ts",
+            Some("src/routes/auth/callback.ts"),
+            "Handles auth callback recovery and billing fallback",
+            &BTreeMap::from([("area".to_string(), "auth".to_string())]),
+        )?;
+        let entity = dashboard
+            .db
+            .list_context_entities(Some(&memory.id), Some("file"), 10)?
+            .into_iter()
+            .find(|entry| entry.name == "callback.ts")
+            .expect("callback entity");
+        dashboard.db.add_context_observation(
+            Some(&memory.id),
+            entity.id,
+            "completion_summary",
+            ContextObservationPriority::Normal,
+            true,
+            "Recovered auth callback incident with billing fallback",
+            &BTreeMap::new(),
+        )?;
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(text.contains("Relevant memory"));
+        assert!(text.contains("[file] callback.ts"));
+        assert!(text.contains("| pinned"));
+        assert!(text.contains("matches auth, callback, recovery"));
+        assert!(text.contains(
+            "memory [normal/pinned] Recovered auth callback incident with billing fallback"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn worktree_diff_columns_split_removed_and_added_lines() {
         let patch = "\
 --- Branch diff vs main ---
@@ -6043,13 +11002,74 @@ diff --git a/src/next.rs b/src/next.rs
 -bye
 +hello";
 
-        let columns = build_worktree_diff_columns(patch);
-        assert!(columns.removals.contains("Branch diff vs main"));
-        assert!(columns.removals.contains("-old line"));
-        assert!(columns.removals.contains("-bye"));
-        assert!(columns.additions.contains("Working tree diff"));
-        assert!(columns.additions.contains("+new line"));
-        assert!(columns.additions.contains("+hello"));
+        let palette = test_dashboard(Vec::new(), 0).theme_palette();
+        let columns = build_worktree_diff_columns(patch, palette);
+        let removals = text_plain_text(&columns.removals);
+        let additions = text_plain_text(&columns.additions);
+        assert!(removals.contains("Branch diff vs main"));
+        assert!(removals.contains("-old line"));
+        assert!(removals.contains("-bye"));
+        assert!(additions.contains("Working tree diff"));
+        assert!(additions.contains("+new line"));
+        assert!(additions.contains("+hello"));
+    }
+
+    #[test]
+    fn split_diff_highlights_changed_words() {
+        let palette = test_dashboard(Vec::new(), 0).theme_palette();
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1 +1 @@
+-old line
++new line";
+
+        let columns = build_worktree_diff_columns(patch, palette);
+        let removal = columns
+            .removals
+            .lines
+            .iter()
+            .find(|line| line_plain_text(line) == "-old line")
+            .expect("removal line");
+        let addition = columns
+            .additions
+            .lines
+            .iter()
+            .find(|line| line_plain_text(line) == "+new line")
+            .expect("addition line");
+
+        assert_eq!(removal.spans[1].content.as_ref(), "old");
+        assert_eq!(removal.spans[1].style, diff_removal_word_style());
+        assert_eq!(removal.spans[2].content.as_ref(), " ");
+        assert_eq!(removal.spans[2].style, diff_removal_style(palette));
+        assert_eq!(addition.spans[1].content.as_ref(), "new");
+        assert_eq!(addition.spans[1].style, diff_addition_word_style());
+    }
+
+    #[test]
+    fn unified_diff_highlights_changed_words() {
+        let palette = test_dashboard(Vec::new(), 0).theme_palette();
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1 +1 @@
+-old line
++new line";
+
+        let text = build_unified_diff_text(patch, palette);
+        let removal = text
+            .lines
+            .iter()
+            .find(|line| line_plain_text(line) == "-old line")
+            .expect("removal line");
+        let addition = text
+            .lines
+            .iter()
+            .find(|line| line_plain_text(line) == "+new line")
+            .expect("addition line");
+
+        assert_eq!(removal.spans[1].content.as_ref(), "old");
+        assert_eq!(removal.spans[1].style, diff_removal_word_style());
+        assert_eq!(addition.spans[1].content.as_ref(), "new");
+        assert_eq!(addition.spans[1].style, diff_addition_word_style());
     }
 
     #[test]
@@ -6105,6 +11125,7 @@ diff --git a/src/next.rs b/src/next.rs
             idle: 1,
             running: 1,
             pending: 1,
+            stale: 0,
             failed: 0,
             stopped: 0,
         });
@@ -6763,6 +11784,91 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
+    fn route_preview_uses_graph_context_for_latest_incoming_handoff() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let older_worker = sample_session(
+            "older-worker",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/older"),
+            128,
+            12,
+        );
+        let auth_worker = sample_session(
+            "auth-worker",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/auth"),
+            256,
+            24,
+        );
+
+        let mut dashboard = test_dashboard(
+            vec![lead.clone(), older_worker.clone(), auth_worker.clone()],
+            0,
+        );
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&older_worker).unwrap();
+        dashboard.db.insert_session(&auth_worker).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "older-worker",
+                "{\"task\":\"Legacy delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "auth-worker",
+                "{\"task\":\"Auth delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard.db.mark_messages_read("older-worker").unwrap();
+        dashboard.db.mark_messages_read("auth-worker").unwrap();
+        dashboard
+            .db
+            .send_message(
+                "planner-root",
+                "lead-12345678",
+                "{\"task\":\"Investigate auth callback recovery\",\"context\":\"Delegated from planner-root\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .upsert_context_entity(
+                Some("auth-worker"),
+                "file",
+                "auth-callback.ts",
+                Some("src/auth/callback.ts"),
+                "Auth callback recovery edge cases",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap();
+        dashboard.sync_selected_messages();
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(
+            dashboard.selected_route_preview.as_deref(),
+            Some("for `Investigate auth callback recovery` reuse idle auth-wor | graph auth, callback, recovery")
+        );
+    }
+
+    #[test]
     fn route_preview_ignores_non_handoff_inbox_noise() {
         let lead = sample_session(
             "lead-12345678",
@@ -7099,6 +12205,26 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
+    fn aggregate_cost_summary_uses_custom_threshold_labels() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.cost_budget_usd = 10.0;
+        cfg.budget_alert_thresholds = crate::config::BudgetAlertThresholds {
+            advisory: 0.40,
+            warning: 0.70,
+            critical: 0.85,
+        };
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 1_000, 7.0)];
+
+        assert_eq!(
+            dashboard.aggregate_cost_summary_text(),
+            "Aggregate cost $7.00 / $10.00 | Budget alert 70%"
+        );
+    }
+
+    #[test]
     fn aggregate_cost_summary_mentions_ninety_percent_alert() {
         let db = StateStore::open(Path::new(":memory:")).unwrap();
         let mut cfg = Config::default();
@@ -7131,6 +12257,483 @@ diff --git a/src/next.rs b/src/next.rs
             Some("Budget alert 75% | tokens 760 / 1,000 | cost $2.00 / $10.00")
         );
         assert_eq!(dashboard.last_budget_alert_state, BudgetState::Alert75);
+    }
+
+    #[test]
+    fn sync_budget_alerts_uses_custom_threshold_labels() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.token_budget = 1_000;
+        cfg.cost_budget_usd = 10.0;
+        cfg.budget_alert_thresholds = crate::config::BudgetAlertThresholds {
+            advisory: 0.40,
+            warning: 0.70,
+            critical: 0.85,
+        };
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 710, 2.0)];
+        dashboard.last_budget_alert_state = BudgetState::Alert50;
+
+        dashboard.sync_budget_alerts();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("Budget alert 70% | tokens 710 / 1,000 | cost $2.00 / $10.00")
+        );
+        assert_eq!(dashboard.last_budget_alert_state, BudgetState::Alert75);
+    }
+
+    #[test]
+    fn refresh_auto_pauses_over_budget_sessions_and_sets_operator_note() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.token_budget = 100;
+        cfg.cost_budget_usd = 0.0;
+
+        db.insert_session(&budget_session("sess-1", 120, 0.0))
+            .expect("insert session");
+        db.update_metrics(
+            "sess-1",
+            &SessionMetrics {
+                input_tokens: 90,
+                output_tokens: 30,
+                tokens_used: 120,
+                tool_calls: 0,
+                files_changed: 0,
+                duration_secs: 0,
+                cost_usd: 0.0,
+            },
+        )
+        .expect("persist metrics");
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.refresh();
+
+        assert_eq!(dashboard.sessions.len(), 1);
+        assert_eq!(dashboard.sessions[0].state, SessionState::Stopped);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("token budget exceeded | auto-paused 1 active session(s)")
+        );
+    }
+
+    #[test]
+    fn refresh_updates_session_state_snapshot_after_completion() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+        let session = Session {
+            id: "done-1".to_string(),
+            task: "complete session".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        };
+        db.insert_session(&session).unwrap();
+
+        let mut dashboard = Dashboard::new(db, Config::default());
+        dashboard
+            .db
+            .update_state("done-1", &SessionState::Completed)
+            .unwrap();
+
+        dashboard.refresh();
+
+        assert_eq!(dashboard.sessions[0].state, SessionState::Completed);
+        assert_eq!(
+            dashboard.last_session_states.get("done-1"),
+            Some(&SessionState::Completed)
+        );
+    }
+
+    #[test]
+    fn refresh_builds_completion_summary_popup_from_metrics_activity_and_logs() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-completion-popup-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".claude").join("metrics"))?;
+
+        let mut cfg = build_config(&root.join(".claude"));
+        cfg.completion_summary_notifications.delivery =
+            crate::notifications::CompletionSummaryDelivery::TuiPopup;
+        cfg.desktop_notifications.session_completed = false;
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut session = sample_session(
+            "done-12345678",
+            "claude",
+            SessionState::Running,
+            Some("ecc/done"),
+            384,
+            95,
+        );
+        session.task = "Finish session summary notifications".to_string();
+        db.insert_session(&session)?;
+
+        let metrics_path = cfg.tool_activity_metrics_path();
+        fs::create_dir_all(metrics_path.parent().unwrap())?;
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"done-12345678\",\"tool_name\":\"Bash\",\"input_summary\":\"cargo test -q\",\"input_params_json\":\"{\\\"command\\\":\\\"cargo test -q\\\"}\",\"output_summary\":\"ok\",\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"done-12345678\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"updated readme\",\"file_events\":[{\"path\":\"README.md\",\"action\":\"create\",\"diff_preview\":\"+ session summary notifications\",\"patch_preview\":\"+ session summary notifications\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n",
+                "{\"id\":\"evt-3\",\"session_id\":\"done-12345678\",\"tool_name\":\"Bash\",\"input_summary\":\"rm -rf build\",\"input_params_json\":\"{\\\"command\\\":\\\"rm -rf build\\\"}\",\"output_summary\":\"ok\",\"timestamp\":\"2026-04-09T00:02:00Z\"}\n"
+            ),
+        )?;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard
+            .db
+            .update_state("done-12345678", &SessionState::Completed)?;
+
+        dashboard.refresh();
+
+        let popup = dashboard
+            .active_completion_popup
+            .as_ref()
+            .expect("completion summary popup");
+        let popup_text = popup.popup_text();
+        assert!(popup_text.contains("done-123"));
+        assert!(popup_text.contains("Tests 1 run / 1 passed"));
+        assert!(popup_text.contains("Recent files"));
+        assert!(popup_text.contains("create README.md"));
+        assert!(popup_text.contains("Warnings"));
+        assert!(popup_text.contains("high-risk tool call"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_persists_completion_summary_observation() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("ecc2-completion-observation-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".claude").join("metrics"))?;
+
+        let mut cfg = build_config(&root.join(".claude"));
+        cfg.completion_summary_notifications.delivery =
+            crate::notifications::CompletionSummaryDelivery::TuiPopup;
+        cfg.desktop_notifications.session_completed = false;
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut session = sample_session(
+            "done-observation",
+            "claude",
+            SessionState::Running,
+            Some("ecc/observation"),
+            144,
+            42,
+        );
+        session.task = "Recover auth callback after wipe".to_string();
+        db.insert_session(&session)?;
+
+        let metrics_path = cfg.tool_activity_metrics_path();
+        fs::create_dir_all(metrics_path.parent().unwrap())?;
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"done-observation\",\"tool_name\":\"Bash\",\"input_summary\":\"cargo test -q\",\"input_params_json\":\"{\\\"command\\\":\\\"cargo test -q\\\"}\",\"output_summary\":\"ok\",\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"done-observation\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/routes/auth/callback.ts\",\"output_summary\":\"updated callback\",\"file_events\":[{\"path\":\"src/routes/auth/callback.ts\",\"action\":\"modify\",\"diff_preview\":\"portal first\",\"patch_preview\":\"+ portal first\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard
+            .db
+            .update_state("done-observation", &SessionState::Completed)?;
+
+        dashboard.refresh();
+
+        let session_entity = dashboard
+            .db
+            .list_context_entities(Some("done-observation"), Some("session"), 10)?
+            .into_iter()
+            .find(|entity| entity.name == "done-observation")
+            .expect("session entity");
+        let observations = dashboard
+            .db
+            .list_context_observations(Some(session_entity.id), 10)?;
+        assert!(!observations.is_empty());
+        assert_eq!(observations[0].observation_type, "completion_summary");
+        assert!(observations[0]
+            .summary
+            .contains("Recover auth callback after wipe"));
+        assert_eq!(
+            observations[0].details.get("tests_run"),
+            Some(&"1".to_string())
+        );
+        assert!(observations[0]
+            .details
+            .get("recent_files")
+            .is_some_and(|value| value.contains("modify src/routes/auth/callback.ts")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn dismiss_completion_popup_promotes_the_next_summary() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.active_completion_popup = Some(SessionCompletionSummary {
+            session_id: "sess-a".to_string(),
+            task: "First".to_string(),
+            state: SessionState::Completed,
+            files_changed: 1,
+            tokens_used: 10,
+            duration_secs: 5,
+            cost_usd: 0.01,
+            tests_run: 1,
+            tests_passed: 1,
+            recent_files: vec!["create README.md".to_string()],
+            key_decisions: vec!["cargo test -q".to_string()],
+            warnings: Vec::new(),
+        });
+        dashboard
+            .queued_completion_popups
+            .push_back(SessionCompletionSummary {
+                session_id: "sess-b".to_string(),
+                task: "Second".to_string(),
+                state: SessionState::Completed,
+                files_changed: 2,
+                tokens_used: 20,
+                duration_secs: 8,
+                cost_usd: 0.02,
+                tests_run: 0,
+                tests_passed: 0,
+                recent_files: vec!["modify src/lib.rs".to_string()],
+                key_decisions: vec!["updated lib".to_string()],
+                warnings: vec!["no test runs detected".to_string()],
+            });
+
+        dashboard.dismiss_completion_popup();
+
+        assert_eq!(
+            dashboard
+                .active_completion_popup
+                .as_ref()
+                .map(|summary| summary.session_id.as_str()),
+            Some("sess-b")
+        );
+        assert!(dashboard.queued_completion_popups.is_empty());
+
+        dashboard.dismiss_completion_popup();
+        assert!(dashboard.active_completion_popup.is_none());
+    }
+
+    #[test]
+    fn refresh_syncs_tool_activity_metrics_from_hook_file() {
+        let tempdir = std::env::temp_dir().join(format!("ecc2-activity-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(tempdir.join("metrics")).unwrap();
+        let db_path = tempdir.join("state.db");
+        let db = StateStore::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "sess-1".to_string(),
+            task: "sync activity".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.db_path = db_path;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        fs::write(
+            tempdir.join("metrics").join("tool-usage.jsonl"),
+            "{\"id\":\"evt-1\",\"session_id\":\"sess-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read README.md\",\"output_summary\":\"ok\",\"file_paths\":[\"README.md\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        dashboard.refresh();
+
+        assert_eq!(dashboard.sessions.len(), 1);
+        assert_eq!(dashboard.sessions[0].metrics.tool_calls, 1);
+        assert_eq!(dashboard.sessions[0].metrics.files_changed, 1);
+
+        let _ = fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn refresh_flags_stale_sessions_and_sets_operator_note() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.session_timeout_secs = 60;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "stale-1".to_string(),
+            task: "stale session".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(4242),
+            worktree: None,
+            created_at: now - Duration::minutes(5),
+            updated_at: now - Duration::minutes(5),
+            last_heartbeat_at: now - Duration::minutes(5),
+            metrics: SessionMetrics::default(),
+        })
+        .unwrap();
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.refresh();
+
+        assert_eq!(dashboard.sessions.len(), 1);
+        assert_eq!(dashboard.sessions[0].state, SessionState::Stale);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("stale heartbeat detected | flagged 1 session(s) for attention")
+        );
+    }
+
+    #[test]
+    fn refresh_enforces_conflicts_and_surfaces_active_incidents() -> Result<()> {
+        let tempdir =
+            std::env::temp_dir().join(format!("dashboard-conflict-refresh-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tempdir)?;
+        let mut cfg = build_config(&tempdir);
+        cfg.session_timeout_secs = 3600;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-a".to_string(),
+            task: "keep active".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(1111),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "session-b".to_string(),
+            task: "later overlap".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(2222),
+            worktree: None,
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        fs::create_dir_all(
+            cfg.tool_activity_metrics_path()
+                .parent()
+                .expect("metrics dir"),
+        )?;
+        fs::write(
+            cfg.tool_activity_metrics_path(),
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-a\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"older change\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:02:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-b\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"later change\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:03:00Z\"}\n"
+            ),
+        )?;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.refresh();
+        dashboard.sync_selection_by_id(Some("session-b"));
+        dashboard.sync_selected_diff();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("file conflict detected | opened 1 incident(s), auto-paused 1 session(s) via escalation")
+        );
+        assert_eq!(
+            dashboard
+                .db
+                .get_session("session-b")?
+                .expect("session-b should exist")
+                .state,
+            SessionState::Stopped
+        );
+
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Active conflicts"));
+        assert!(metrics_text.contains("src/lib.rs"));
+        assert!(metrics_text.contains("escalate"));
+
+        let conflict_protocol = dashboard
+            .selected_conflict_protocol
+            .clone()
+            .expect("conflict protocol should be present");
+        assert!(conflict_protocol.contains("Session overlap incidents"));
+        assert!(conflict_protocol.contains("ecc resume session-b"));
+
+        dashboard.refresh();
+        assert_eq!(
+            dashboard
+                .db
+                .list_open_conflict_incidents_for_session("session-b", 10)?
+                .len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(tempdir);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_harness_summary() -> Result<()> {
+        let tempdir = std::env::temp_dir().join(format!(
+            "ecc2-dashboard-harness-metrics-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(tempdir.join(".claude"))?;
+        fs::create_dir_all(tempdir.join(".codex"))?;
+
+        let now = Utc::now();
+        let session = Session {
+            id: "sess-harness".to_string(),
+            task: "Map harness metadata".to_string(),
+            project: "ecc".to_string(),
+            task_group: "compat".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.clone(),
+            state: SessionState::Running,
+            pid: Some(4242),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        };
+
+        let dashboard = test_dashboard(vec![session], 0);
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Harness claude | Detected claude, codex"));
+
+        let _ = fs::remove_dir_all(tempdir);
+        Ok(())
     }
 
     #[test]
@@ -7197,7 +12800,7 @@ diff --git a/src/next.rs b/src/next.rs
 
         assert_eq!(
             request,
-            SpawnRequest {
+            SpawnRequest::AdHoc {
                 requested_count: 10,
                 task: "stabilize the queue".to_string(),
             }
@@ -7210,9 +12813,29 @@ diff --git a/src/next.rs b/src/next.rs
 
         assert_eq!(
             request,
-            SpawnRequest {
+            SpawnRequest::AdHoc {
                 requested_count: 1,
                 task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_extracts_template_request() {
+        let request = parse_spawn_request(
+            "template feature_development for stabilize auth callback with component=billing, area=oauth",
+        )
+        .expect("template request should parse");
+
+        assert_eq!(
+            request,
+            SpawnRequest::Template {
+                name: "feature_development".to_string(),
+                task: Some("stabilize auth callback".to_string()),
+                variables: BTreeMap::from([
+                    ("area".to_string(), "oauth".to_string()),
+                    ("component".to_string(), "billing".to_string()),
+                ]),
             }
         );
     }
@@ -7234,12 +12857,152 @@ diff --git a/src/next.rs b/src/next.rs
 
         assert_eq!(
             plan,
-            SpawnPlan {
+            SpawnPlan::AdHoc {
                 requested_count: 9,
                 spawn_count: 5,
                 task: "ship release notes".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn build_spawn_plan_resolves_template_steps() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.orchestration_templates = BTreeMap::from([(
+            "feature_development".to_string(),
+            crate::config::OrchestrationTemplateConfig {
+                description: None,
+                project: None,
+                task_group: None,
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(true),
+                steps: vec![
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("planner".to_string()),
+                        task: "Plan {{task}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("builder".to_string()),
+                        task: "Build {{task}} in {{component}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                ],
+            },
+        )]);
+
+        let plan = dashboard
+            .build_spawn_plan(
+                "template feature_development for stabilize auth callback with component=billing",
+            )
+            .expect("template spawn plan");
+
+        assert_eq!(
+            plan,
+            SpawnPlan::Template {
+                name: "feature_development".to_string(),
+                task: Some("stabilize auth callback".to_string()),
+                variables: BTreeMap::from([("component".to_string(), "billing".to_string(),)]),
+                step_count: 2,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_spawn_prompt_launches_orchestration_template() -> Result<()> {
+        let tempdir = std::env::temp_dir().join(format!("dashboard-template-{}", Uuid::new_v4()));
+        let repo_root = tempdir.join("repo");
+        init_git_repo(&repo_root)?;
+
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&repo_root)?;
+
+        let mut cfg = build_config(&tempdir);
+        cfg.orchestration_templates = BTreeMap::from([(
+            "feature_development".to_string(),
+            crate::config::OrchestrationTemplateConfig {
+                description: None,
+                project: Some("ecc2-smoke".to_string()),
+                task_group: Some("{{task}}".to_string()),
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(false),
+                steps: vec![
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("planner".to_string()),
+                        task: "Plan {{task}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("builder".to_string()),
+                        task: "Build {{task}} in {{component}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                ],
+            },
+        )]);
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.spawn_input = Some(
+            "template feature_development for stabilize auth callback with component=billing"
+                .to_string(),
+        );
+
+        dashboard.submit_spawn_prompt().await;
+
+        let operator_note = dashboard
+            .operator_note
+            .clone()
+            .expect("template launch should set an operator note");
+        assert!(
+            operator_note.contains(
+                "launched template feature_development (2/2 step(s)) for stabilize auth callback"
+            ),
+            "unexpected operator note: {operator_note}"
+        );
+        assert_eq!(dashboard.sessions.len(), 2);
+        assert!(dashboard
+            .sessions
+            .iter()
+            .all(|session| session.project == "ecc2-smoke"));
+        assert!(dashboard
+            .sessions
+            .iter()
+            .all(|session| session.task_group == "stabilize auth callback"));
+        let tasks = dashboard
+            .sessions
+            .iter()
+            .map(|session| session.task.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tasks,
+            std::collections::BTreeSet::from([
+                "Build stabilize auth callback in billing",
+                "Plan stabilize auth callback",
+            ])
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        let _ = std::fs::remove_dir_all(&tempdir);
+        Ok(())
     }
 
     #[test]
@@ -7263,6 +13026,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "older".to_string(),
             task: "older".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Idle,
@@ -7270,12 +13035,15 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
         db.insert_session(&Session {
             id: "newer".to_string(),
             task: "newer".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -7283,6 +13051,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now + chrono::Duration::seconds(1),
+            last_heartbeat_at: now + chrono::Duration::seconds(1),
             metrics: SessionMetrics::default(),
         })?;
 
@@ -7305,6 +13074,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "inspect output".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -7312,6 +13083,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -7347,6 +13119,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "tail output".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -7354,6 +13128,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -7981,6 +13756,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "running-1".to_string(),
             task: "stop me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             state: SessionState::Running,
             working_dir: PathBuf::from("/tmp"),
@@ -7988,6 +13765,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8014,6 +13792,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "failed-1".to_string(),
             task: "resume me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             state: SessionState::Failed,
             working_dir: PathBuf::from("/tmp/ecc2-resume"),
@@ -8025,6 +13805,7 @@ diff --git a/src/next.rs b/src/next.rs
             }),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8053,6 +13834,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "stopped-1".to_string(),
             task: "cleanup me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             state: SessionState::Stopped,
             working_dir: worktree_path.clone(),
@@ -8064,6 +13847,7 @@ diff --git a/src/next.rs b/src/next.rs
             }),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8093,6 +13877,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "running-1".to_string(),
             task: "keep alive".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -8100,6 +13886,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8129,6 +13916,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "running-1".to_string(),
             task: "keep worktree".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: active_path.clone(),
             state: SessionState::Running,
@@ -8140,11 +13929,14 @@ diff --git a/src/next.rs b/src/next.rs
             }),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
         db.insert_session(&Session {
             id: "stopped-1".to_string(),
             task: "prune me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: stopped_path.clone(),
             state: SessionState::Stopped,
@@ -8156,6 +13948,7 @@ diff --git a/src/next.rs b/src/next.rs
             }),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8184,6 +13977,57 @@ diff --git a/src/next.rs b/src/next.rs
         Ok(())
     }
 
+    #[tokio::test]
+    async fn prune_inactive_worktrees_reports_retained_sessions_within_retention() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!("ecc2-dashboard-{}.db", Uuid::new_v4()));
+        let db = StateStore::open(&db_path)?;
+        let now = Utc::now();
+        let retained_path = std::env::temp_dir().join(format!("ecc2-retained-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&retained_path)?;
+
+        db.insert_session(&Session {
+            id: "stopped-1".to_string(),
+            task: "retain me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: retained_path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(WorktreeInfo {
+                path: retained_path.clone(),
+                branch: "ecc/stopped-1".to_string(),
+                base_branch: "main".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let mut cfg = Config::default();
+        cfg.db_path = db_path.clone();
+        cfg.worktree_retention_secs = 3600;
+
+        let dashboard_store = StateStore::open(&db_path)?;
+        let mut dashboard = Dashboard::new(dashboard_store, cfg);
+        dashboard.prune_inactive_worktrees().await;
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("deferred 1 inactive worktree(s) within retention")
+        );
+        assert!(db
+            .get_session("stopped-1")?
+            .expect("stopped session should exist")
+            .worktree
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(retained_path);
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn merge_selected_worktree_sets_operator_note_when_ready() -> Result<()> {
         let tempdir = std::env::temp_dir().join(format!("dashboard-merge-{}", Uuid::new_v4()));
@@ -8198,6 +14042,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: session_id.clone(),
             task: "merge via dashboard".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: worktree.path.clone(),
             state: SessionState::Completed,
@@ -8205,6 +14051,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: Some(worktree.clone()),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8279,6 +14126,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "merge-ready".to_string(),
             task: "merge via dashboard".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: merged_worktree.path.clone(),
             state: SessionState::Completed,
@@ -8286,6 +14135,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: Some(merged_worktree.clone()),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8294,6 +14144,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "active-ready".to_string(),
             task: "still active".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: active_worktree.path.clone(),
             state: SessionState::Running,
@@ -8301,6 +14153,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: Some(active_worktree.clone()),
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8337,6 +14190,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "done-1".to_string(),
             task: "delete me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Completed,
@@ -8344,6 +14199,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8369,6 +14225,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "lead-1".to_string(),
             task: "coordinate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -8376,6 +14234,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8401,6 +14260,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "lead-1".to_string(),
             task: "coordinate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -8408,6 +14269,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8433,6 +14295,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "lead-1".to_string(),
             task: "coordinate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -8440,6 +14304,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8465,6 +14330,8 @@ diff --git a/src/next.rs b/src/next.rs
         db.insert_session(&Session {
             id: "lead-1".to_string(),
             task: "coordinate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -8472,6 +14339,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
@@ -8733,6 +14601,11 @@ diff --git a/src/next.rs b/src/next.rs
 
     #[test]
     fn pane_command_mode_sets_layout() {
+        let tempdir = std::env::temp_dir().join(format!("ecc2-pane-command-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tempdir);
+
         let mut dashboard = test_dashboard(Vec::new(), 0);
         dashboard.cfg.pane_layout = PaneLayout::Horizontal;
 
@@ -8747,10 +14620,22 @@ diff --git a/src/next.rs b/src/next.rs
             .operator_note
             .as_deref()
             .is_some_and(|note| note.contains("pane layout set to grid | saved to ")));
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(tempdir);
     }
 
     #[test]
     fn cycle_pane_layout_rotates_and_hides_log_when_leaving_grid() {
+        let tempdir = std::env::temp_dir().join(format!("ecc2-cycle-pane-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tempdir);
+
         let mut dashboard = test_dashboard(Vec::new(), 0);
         dashboard.cfg.pane_layout = PaneLayout::Grid;
         dashboard.cfg.linear_pane_size_percent = 44;
@@ -8763,6 +14648,13 @@ diff --git a/src/next.rs b/src/next.rs
         assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Horizontal);
         assert_eq!(dashboard.pane_size_percent, 44);
         assert_eq!(dashboard.selected_pane, Pane::Sessions);
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(tempdir);
     }
 
     #[test]
@@ -8992,9 +14884,40 @@ diff --git a/src/next.rs b/src/next.rs
         )
     }
 
+    fn line_plain_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn text_plain_text(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn test_dashboard(sessions: Vec<Session>, selected_session: usize) -> Dashboard {
         let selected_session = selected_session.min(sessions.len().saturating_sub(1));
         let cfg = Config::default();
+        let notifier = DesktopNotifier::new(cfg.desktop_notifications.clone());
+        let webhook_notifier = WebhookNotifier::new(cfg.webhook_notifications.clone());
+        let last_session_states = sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.state.clone()))
+            .collect();
+        let session_harnesses = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    SessionHarnessInfo::detect(&session.agent_type, &session.working_dir)
+                        .with_config_detection(&cfg, &session.working_dir),
+                )
+            })
+            .collect();
         let output_store = SessionOutputStore::default();
         let output_rx = output_store.subscribe();
         let mut session_table_state = TableState::default();
@@ -9008,12 +14931,16 @@ diff --git a/src/next.rs b/src/next.rs
             cfg,
             output_store,
             output_rx,
+            notifier,
+            webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
             approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
+            board_meta_by_session: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
             global_handoff_backlog_messages: 0,
@@ -9028,9 +14955,20 @@ diff --git a/src/next.rs b/src/next.rs
             selected_diff_summary: None,
             selected_diff_preview: Vec::new(),
             selected_diff_patch: None,
+            selected_diff_hunk_offsets_unified: Vec::new(),
+            selected_diff_hunk_offsets_split: Vec::new(),
+            selected_diff_hunk: 0,
+            diff_view_mode: DiffViewMode::Split,
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
+            selected_git_status_entries: Vec::new(),
+            selected_git_status: 0,
+            selected_git_patch: None,
+            selected_git_patch_hunk_offsets_unified: Vec::new(),
+            selected_git_patch_hunk_offsets_split: Vec::new(),
+            selected_git_patch_hunk: 0,
             output_mode: OutputMode::SessionOutput,
+            graph_entity_filter: GraphEntityFilter::All,
             output_filter: OutputFilter::All,
             output_time_filter: OutputTimeFilter::AllTime,
             timeline_event_filter: TimelineEventFilter::All,
@@ -9048,14 +14986,21 @@ diff --git a/src/next.rs b/src/next.rs
             collapsed_panes: HashSet::new(),
             search_input: None,
             spawn_input: None,
+            commit_input: None,
+            pr_input: None,
             search_query: None,
             search_scope: SearchScope::SelectedSession,
             search_agent_filter: SearchAgentFilter::AllAgents,
             search_matches: Vec::new(),
             selected_search_match: 0,
+            active_completion_popup: None,
+            queued_completion_popups: VecDeque::new(),
             session_table_state,
             last_cost_metrics_signature: None,
+            last_tool_activity_signature: None,
             last_budget_alert_state: BudgetState::Normal,
+            last_session_states,
+            last_seen_approval_message_id: None,
         }
     }
 
@@ -9063,17 +15008,32 @@ diff --git a/src/next.rs b/src/next.rs
         Config {
             db_path: root.join("state.db"),
             worktree_root: root.join("worktrees"),
+            worktree_branch_prefix: "ecc".to_string(),
             max_parallel_sessions: 4,
             max_parallel_worktrees: 4,
+            worktree_retention_secs: 0,
             session_timeout_secs: 60,
             heartbeat_interval_secs: 5,
+            auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
+            default_agent_profile: None,
+            harness_runners: Default::default(),
+            agent_profiles: Default::default(),
+            orchestration_templates: Default::default(),
+            memory_connectors: Default::default(),
+            computer_use_dispatch: crate::config::ComputerUseDispatchConfig::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
             auto_merge_ready_worktrees: false,
+            desktop_notifications: crate::notifications::DesktopNotificationConfig::default(),
+            webhook_notifications: crate::notifications::WebhookNotificationConfig::default(),
+            completion_summary_notifications:
+                crate::notifications::CompletionSummaryConfig::default(),
             cost_budget_usd: 10.0,
             token_budget: 500_000,
+            budget_alert_thresholds: crate::config::Config::BUDGET_ALERT_THRESHOLDS,
+            conflict_resolution: crate::config::ConflictResolutionConfig::default(),
             theme: Theme::Dark,
             pane_layout: PaneLayout::Horizontal,
             pane_navigation: Default::default(),
@@ -9106,6 +15066,18 @@ diff --git a/src/next.rs b/src/next.rs
         Ok(())
     }
 
+    fn git_stdout(path: &Path, args: &[&str]) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn sample_session(
         id: &str,
         agent_type: &str,
@@ -9117,6 +15089,8 @@ diff --git a/src/next.rs b/src/next.rs
         Session {
             id: id.to_string(),
             task: "Render dashboard rows".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: agent_type.to_string(),
             state,
             working_dir: branch
@@ -9130,6 +15104,7 @@ diff --git a/src/next.rs b/src/next.rs
             }),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            last_heartbeat_at: Utc::now(),
             metrics: SessionMetrics {
                 input_tokens: tokens_used.saturating_mul(3) / 4,
                 output_tokens: tokens_used / 4,
@@ -9147,6 +15122,8 @@ diff --git a/src/next.rs b/src/next.rs
         Session {
             id: id.to_string(),
             task: "Budget tracking".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             state: SessionState::Running,
             working_dir: PathBuf::from("/tmp"),
@@ -9154,6 +15131,7 @@ diff --git a/src/next.rs b/src/next.rs
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics {
                 input_tokens: tokens_used.saturating_mul(3) / 4,
                 output_tokens: tokens_used / 4,

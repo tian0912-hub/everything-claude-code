@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const CATEGORIES = [
@@ -187,7 +188,7 @@ function detectTargetMode(rootDir) {
 }
 
 function findPluginInstall(rootDir) {
-  const homeDir = process.env.HOME || '';
+  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir() || '';
   const pluginDirs = [
     'ecc',
     'ecc@ecc',
@@ -196,7 +197,9 @@ function findPluginInstall(rootDir) {
   ];
   const candidateRoots = [
     path.join(rootDir, '.claude', 'plugins'),
+    path.join(rootDir, '.claude', 'plugins', 'marketplaces'),
     homeDir && path.join(homeDir, '.claude', 'plugins'),
+    homeDir && path.join(homeDir, '.claude', 'plugins', 'marketplaces'),
   ].filter(Boolean);
   const candidates = candidateRoots.flatMap((pluginsDir) =>
     pluginDirs.flatMap((pluginDir) => [
@@ -389,11 +392,11 @@ function getRepoChecks(rootDir) {
       id: 'eval-commands',
       category: 'Eval Coverage',
       points: 4,
-      scopes: ['repo', 'commands'],
-      path: 'commands/eval.md',
-      description: 'Eval and verification commands exist',
-      pass: fileExists(rootDir, 'commands/eval.md') && fileExists(rootDir, 'commands/verify.md') && fileExists(rootDir, 'commands/checkpoint.md'),
-      fix: 'Add eval/checkpoint/verify commands to standardize verification loops.',
+      scopes: ['repo', 'commands', 'skills'],
+      path: 'commands/checkpoint.md',
+      description: 'Checkpoint command and eval/verification skills exist',
+      pass: fileExists(rootDir, 'commands/checkpoint.md') && fileExists(rootDir, 'skills/eval-harness/SKILL.md') && fileExists(rootDir, 'skills/verification-loop/SKILL.md'),
+      fix: 'Add checkpoint command plus eval-harness and verification-loop skills to standardize verification loops.',
     },
     {
       id: 'eval-tests-presence',

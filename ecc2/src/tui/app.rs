@@ -27,6 +27,18 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                if dashboard.has_active_completion_popup() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (_, KeyCode::Esc) | (_, KeyCode::Enter) | (_, KeyCode::Char(' ')) => {
+                            dashboard.dismiss_completion_popup();
+                        }
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
                 if dashboard.is_input_mode() {
                     match (key.modifiers, key.code) {
                         (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
@@ -53,7 +65,9 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
 
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
-                    (KeyModifiers::CONTROL, KeyCode::Char('w')) => dashboard.begin_pane_command_mode(),
+                    (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+                        dashboard.begin_pane_command_mode()
+                    }
                     (_, KeyCode::Char('q')) => break,
                     _ if dashboard.handle_pane_navigation_key(key) => {}
                     (_, KeyCode::Tab) => dashboard.next_pane(),
@@ -84,11 +98,24 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('I')) => dashboard.focus_next_approval_target(),
                     (_, KeyCode::Char('g')) => dashboard.auto_dispatch_backlog().await,
                     (_, KeyCode::Char('G')) => dashboard.coordinate_backlog().await,
+                    (_, KeyCode::Char('K')) => dashboard.toggle_context_graph_mode(),
                     (_, KeyCode::Char('h')) => dashboard.collapse_selected_pane(),
                     (_, KeyCode::Char('H')) => dashboard.restore_collapsed_panes(),
                     (_, KeyCode::Char('y')) => dashboard.toggle_timeline_mode(),
+                    (_, KeyCode::Char('E')) if dashboard.is_context_graph_mode() => {
+                        dashboard.cycle_graph_entity_filter()
+                    }
                     (_, KeyCode::Char('E')) => dashboard.cycle_timeline_event_filter(),
                     (_, KeyCode::Char('v')) => dashboard.toggle_output_mode(),
+                    (_, KeyCode::Char('z')) => dashboard.toggle_git_status_mode(),
+                    (_, KeyCode::Char('V')) => dashboard.toggle_diff_view_mode(),
+                    (_, KeyCode::Char('S')) => dashboard.stage_selected_git_status(),
+                    (_, KeyCode::Char('U')) => dashboard.unstage_selected_git_status(),
+                    (_, KeyCode::Char('R')) => dashboard.reset_selected_git_status(),
+                    (_, KeyCode::Char('C')) => dashboard.begin_commit_prompt(),
+                    (_, KeyCode::Char('P')) => dashboard.begin_pr_prompt(),
+                    (_, KeyCode::Char('{')) => dashboard.prev_diff_hunk(),
+                    (_, KeyCode::Char('}')) => dashboard.next_diff_hunk(),
                     (_, KeyCode::Char('c')) => dashboard.toggle_conflict_protocol_mode(),
                     (_, KeyCode::Char('e')) => dashboard.toggle_output_filter(),
                     (_, KeyCode::Char('f')) => dashboard.cycle_output_time_filter(),

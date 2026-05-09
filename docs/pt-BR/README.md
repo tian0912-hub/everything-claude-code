@@ -80,6 +80,15 @@ Este repositório contém apenas o código. Os guias explicam tudo.
 
 ## O Que Há de Novo
 
+### v2.0.0-rc.1 — Sincronização de Superfície, Fluxos Operacionais e ECC 2.0 Alpha (Abr 2026)
+
+- **Superfície pública sincronizada com o repositório real** — metadados, contagens de catálogo, manifests de plugin e documentação de instalação agora refletem a superfície OSS que realmente é entregue.
+- **Expansão dos fluxos operacionais e externos** — `brand-voice`, `social-graph-ranker`, `customer-billing-ops`, `google-workspace-ops` e skills relacionadas fortalecem a trilha operacional dentro do mesmo sistema.
+- **Ferramentas de mídia e lançamento** — `manim-video`, `remotion-video-creation` e os fluxos de publicação social colocam explicadores técnicos e lançamento no mesmo repositório.
+- **Crescimento de framework e superfície de produto** — `nestjs-patterns`, superfícies de instalação mais ricas para Codex/OpenCode e melhorias de empacotamento cross-harness ampliam o uso além do Claude Code.
+- **ECC 2.0 alpha já está no repositório** — o plano de controle em Rust dentro de `ecc2/` já compila localmente e expõe `dashboard`, `start`, `sessions`, `status`, `stop`, `resume` e `daemon`.
+- **Fortalecimento do ecossistema** — AgentShield, controles de custo do ECC Tools, trabalho no portal de billing e a renovação do site continuam sendo entregues ao redor do plugin principal.
+
 ### v1.9.0 — Instalação Seletiva e Expansão de Idiomas (Mar 2026)
 
 - **Arquitetura de instalação seletiva** — Pipeline de instalação baseado em manifesto com `install-plan.js` e `install-apply.js` para instalação de componentes direcionada. O state store rastreia o que está instalado e habilita atualizações incrementais.
@@ -115,7 +124,7 @@ Comece em menos de 2 minutos:
 /plugin marketplace add https://github.com/affaan-m/everything-claude-code
 
 # Instalar plugin
-/plugin install ecc@ecc
+/plugin install everything-claude-code@everything-claude-code
 ```
 
 ### Passo 2: Instalar as Regras (Obrigatório)
@@ -152,13 +161,13 @@ npx ecc-install typescript
 
 ```bash
 # Experimente um comando (a instalação do plugin usa forma com namespace)
-/ecc:plan "Adicionar autenticação de usuário"
+/everything-claude-code:plan "Adicionar autenticação de usuário"
 
 # Instalação manual (Opção 2) usa a forma mais curta:
 # /plan "Adicionar autenticação de usuário"
 
 # Verificar comandos disponíveis
-/plugin list ecc@ecc
+/plugin list everything-claude-code@everything-claude-code
 ```
 
 **Pronto!** Você agora tem acesso a 28 agentes, 116 skills e 59 comandos.
@@ -304,7 +313,7 @@ claude --version
 /plugin marketplace add https://github.com/affaan-m/everything-claude-code
 
 # Instalar o plugin
-/plugin install ecc@ecc
+/plugin install everything-claude-code@everything-claude-code
 ```
 
 Ou adicione diretamente ao seu `~/.claude/settings.json`:
@@ -320,7 +329,7 @@ Ou adicione diretamente ao seu `~/.claude/settings.json`:
     }
   },
   "enabledPlugins": {
-    "ecc@ecc": true
+    "everything-claude-code@everything-claude-code": true
   }
 }
 ```
@@ -399,8 +408,8 @@ Regras são diretrizes sempre seguidas, organizadas em `common/` (agnóstico à 
 
 | Quero... | Use este comando | Agente usado |
 |----------|-----------------|--------------|
-| Planejar um novo recurso | `/ecc:plan "Adicionar auth"` | planner |
-| Projetar arquitetura de sistema | `/ecc:plan` + agente architect | architect |
+| Planejar um novo recurso | `/everything-claude-code:plan "Adicionar auth"` | planner |
+| Projetar arquitetura de sistema | `/everything-claude-code:plan` + agente architect | architect |
 | Escrever código com testes primeiro | `/tdd` | tdd-guide |
 | Revisar código que acabei de escrever | `/code-review` | code-reviewer |
 | Corrigir build com falha | `/build-fix` | build-error-resolver |
@@ -415,7 +424,7 @@ Regras são diretrizes sempre seguidas, organizadas em `common/` (agnóstico à 
 
 **Começando um novo recurso:**
 ```
-/ecc:plan "Adicionar autenticação de usuário com OAuth"
+/everything-claude-code:plan "Adicionar autenticação de usuário com OAuth"
                                               → planner cria blueprint de implementação
 /tdd                                          → tdd-guide aplica escrita de testes primeiro
 /code-review                                  → code-reviewer verifica seu trabalho
@@ -443,7 +452,7 @@ Regras são diretrizes sempre seguidas, organizadas em `common/` (agnóstico à 
 <summary><b>Como verificar quais agentes/comandos estão instalados?</b></summary>
 
 ```bash
-/plugin list ecc@ecc
+/plugin list everything-claude-code@everything-claude-code
 ```
 </details>
 
