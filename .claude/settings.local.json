@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/tianbin/.claude/plugins/**)",
+      "Read(//Users/tianbin/.claude/agents/**)",
+      "Bash(python3 -m json.tool)",
+      "Bash(npx ecc *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d.get\\('version','no version'\\)\\)\")",
+      "Bash(git *)",
+      "Bash(node scripts/install-apply.js --help)",
+      "Bash(python3 -c \" import sys, json data = json.load\\(sys.stdin\\) for name, profile in data['profiles'].items\\(\\): print\\(f\\\\\" {name}: {profile.get\\('description', 'no desc'\\)[:100]}\\\\\"\\)\")"
+    ]
+  }
+}
